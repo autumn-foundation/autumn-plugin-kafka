@@ -82,35 +82,86 @@ pub struct HealthSettings {
     pub timeout_ms: u64,
 }
 
+const REDACTED: &str = "<redacted>";
+
 impl Default for KafkaConfig {
     fn default() -> Self {
-        todo!()
+        Self {
+            brokers: "localhost:9092".to_owned(),
+            client_id: "autumn".to_owned(),
+            group_id: None,
+            properties: BTreeMap::new(),
+            producer: ProducerSettings::default(),
+            consumer: ConsumerSettings::default(),
+            health: HealthSettings::default(),
+            shutdown_timeout_ms: 10_000,
+        }
     }
 }
 
 impl Default for ProducerSettings {
     fn default() -> Self {
-        todo!()
+        Self {
+            properties: BTreeMap::new(),
+            send_timeout_ms: 5000,
+        }
     }
 }
 
 impl Default for HealthSettings {
     fn default() -> Self {
-        todo!()
+        Self {
+            readiness: false,
+            timeout_ms: 1500,
+        }
     }
 }
 
 impl std::fmt::Debug for KafkaConfig {
-    fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        todo!()
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KafkaConfig")
+            .field("brokers", &self.brokers)
+            .field("client_id", &self.client_id)
+            .field("group_id", &self.group_id)
+            .field("properties", &redacted(&self.properties))
+            .field("producer.properties", &redacted(&self.producer.properties))
+            .field("producer.send_timeout_ms", &self.producer.send_timeout_ms)
+            .field("consumer.properties", &redacted(&self.consumer.properties))
+            .field("health", &self.health)
+            .field("shutdown_timeout_ms", &self.shutdown_timeout_ms)
+            .finish()
     }
+}
+
+/// Returns `true` if the property value can hold a secret.
+fn is_secret_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    ["password", "secret", "ssl.key.pem", "oauthbearer.config"]
+        .iter()
+        .any(|part| key.contains(part))
+}
+
+fn redacted(map: &BTreeMap<String, String>) -> BTreeMap<&str, &str> {
+    map.iter()
+        .map(|(k, v)| {
+            let value = if is_secret_key(k) {
+                REDACTED
+            } else {
+                v.as_str()
+            };
+            (k.as_str(), value)
+        })
+        .collect()
 }
 
 impl KafkaConfig {
     /// Makes a config with default values and the given brokers.
     #[must_use]
-    pub fn new(_brokers: impl Into<String>) -> Self {
-        todo!()
+    pub fn new(brokers: impl Into<String>) -> Self {
+        Self {
+            brokers: brokers.into(),
+            ..Self::default()
+        }
     }
 
     /// Reads the `[kafka]` section of one TOML document.
@@ -121,8 +172,11 @@ impl KafkaConfig {
     /// # Errors
     ///
     /// Returns [`KafkaError::Config`] if the TOML is not valid.
-    pub fn from_toml_str(_toml: &str) -> Result<Self, KafkaError> {
-        todo!()
+    pub fn from_toml_str(toml: &str) -> Result<Self, KafkaError> {
+        let root = parse_table(toml, "TOML input")?;
+        let mut section = toml::Table::new();
+        merge_section(&mut section, root.get("kafka"), "[kafka]")?;
+        from_table(section)
     }
 
     /// Loads the config with the same layers as Autumn.
@@ -146,11 +200,34 @@ impl KafkaConfig {
     /// # Errors
     ///
     /// See [`load`](Self::load).
-    pub fn load_with_env(
-        _profile: &str,
-        _env: &HashMap<String, String>,
-    ) -> Result<Self, KafkaError> {
-        todo!()
+    pub fn load_with_env(profile: &str, env: &HashMap<String, String>) -> Result<Self, KafkaError> {
+        let mut section = toml::Table::new();
+
+        if let Some(base) = read_file("autumn.toml", env)? {
+            merge_section(&mut section, base.get("kafka"), "[kafka]")?;
+            let inline = base
+                .get("profile")
+                .and_then(|p| p.get(profile))
+                .and_then(|p| p.get("kafka"));
+            merge_section(&mut section, inline, "[profile.<name>.kafka]")?;
+        }
+        if let Some(file) = read_file(&format!("autumn-{profile}.toml"), env)? {
+            merge_section(&mut section, file.get("kafka"), "[kafka]")?;
+        }
+
+        interpolate_table(&mut section, env)?;
+        let mut config = from_table(section)?;
+
+        if let Some(v) = env.get("AUTUMN_KAFKA__BROKERS") {
+            config.brokers.clone_from(v);
+        }
+        if let Some(v) = env.get("AUTUMN_KAFKA__CLIENT_ID") {
+            config.client_id.clone_from(v);
+        }
+        if let Some(v) = env.get("AUTUMN_KAFKA__GROUP_ID") {
+            config.group_id = Some(v.clone());
+        }
+        Ok(config)
     }
 
     /// Makes sure that the config can work.
@@ -159,7 +236,27 @@ impl KafkaConfig {
     ///
     /// Returns [`KafkaError::Config`] with the first problem found.
     pub fn validate(&self) -> Result<(), KafkaError> {
-        todo!()
+        let fail = |msg: &str| Err(KafkaError::Config(msg.to_owned()));
+        if self.brokers.trim().is_empty() {
+            return fail("brokers must not be empty");
+        }
+        if self.client_id.trim().is_empty() {
+            return fail("client_id must not be empty");
+        }
+        if self
+            .group_id
+            .as_deref()
+            .is_some_and(|g| g.trim().is_empty())
+        {
+            return fail("group_id must not be blank");
+        }
+        if self.producer.send_timeout_ms == 0 {
+            return fail("producer.send_timeout_ms must be greater than 0");
+        }
+        if self.health.timeout_ms == 0 {
+            return fail("health.timeout_ms must be greater than 0");
+        }
+        Ok(())
     }
 
     /// Returns the full `librdkafka` property map for one client role.
@@ -167,9 +264,106 @@ impl KafkaConfig {
     /// Role properties override shared properties.
     /// Shared properties override `brokers` and `client_id`.
     #[must_use]
-    pub fn client_properties(&self, _role: ClientRole) -> BTreeMap<String, String> {
-        todo!()
+    pub fn client_properties(&self, role: ClientRole) -> BTreeMap<String, String> {
+        let mut props = BTreeMap::new();
+        props.insert("bootstrap.servers".to_owned(), self.brokers.clone());
+        props.insert("client.id".to_owned(), self.client_id.clone());
+        props.extend(self.properties.clone());
+        let role_props = match role {
+            ClientRole::Producer => &self.producer.properties,
+            ClientRole::Consumer => &self.consumer.properties,
+        };
+        props.extend(role_props.clone());
+        props
     }
+}
+
+fn parse_table(text: &str, origin: &str) -> Result<toml::Table, KafkaError> {
+    toml::from_str(text).map_err(|e| KafkaError::Config(format!("{origin}: {e}")))
+}
+
+fn from_table(section: toml::Table) -> Result<KafkaConfig, KafkaError> {
+    toml::Value::Table(section)
+        .try_into()
+        .map_err(|e: toml::de::Error| KafkaError::Config(format!("[kafka]: {e}")))
+}
+
+/// Reads a config file with the same lookup as Autumn.
+///
+/// The lookup uses `AUTUMN_MANIFEST_DIR` first, then the current directory.
+fn read_file(name: &str, env: &HashMap<String, String>) -> Result<Option<toml::Table>, KafkaError> {
+    let path = env
+        .get("AUTUMN_MANIFEST_DIR")
+        .map(|dir| std::path::Path::new(dir).join(name))
+        .filter(|p| p.exists())
+        .unwrap_or_else(|| name.into());
+    match std::fs::read_to_string(&path) {
+        Ok(text) => parse_table(&text, &path.display().to_string()).map(Some),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(KafkaError::Config(format!("{}: {e}", path.display()))),
+    }
+}
+
+fn merge_section(
+    target: &mut toml::Table,
+    layer: Option<&toml::Value>,
+    origin: &str,
+) -> Result<(), KafkaError> {
+    match layer {
+        None => Ok(()),
+        Some(toml::Value::Table(t)) => {
+            merge_tables(target, t);
+            Ok(())
+        }
+        Some(_) => Err(KafkaError::Config(format!("{origin} must be a table"))),
+    }
+}
+
+/// Merges `layer` into `target`. Nested tables merge. Other values replace.
+fn merge_tables(target: &mut toml::Table, layer: &toml::Table) {
+    for (key, value) in layer {
+        match (target.get_mut(key), value) {
+            (Some(toml::Value::Table(t)), toml::Value::Table(l)) => merge_tables(t, l),
+            _ => {
+                target.insert(key.clone(), value.clone());
+            }
+        }
+    }
+}
+
+fn interpolate_table(
+    table: &mut toml::Table,
+    env: &HashMap<String, String>,
+) -> Result<(), KafkaError> {
+    for (_, value) in table.iter_mut() {
+        match value {
+            toml::Value::String(s) => *s = interpolate(s, env)?,
+            toml::Value::Table(t) => interpolate_table(t, env)?,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Replaces each `${NAME}` in `text` with the variable `NAME`.
+fn interpolate(text: &str, env: &HashMap<String, String>) -> Result<String, KafkaError> {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let end = after
+            .find('}')
+            .ok_or_else(|| KafkaError::Config(format!("unclosed \"${{\" in {text:?}")))?;
+        let name = &after[..end];
+        let value = env
+            .get(name)
+            .ok_or_else(|| KafkaError::Config(format!("environment variable {name} is not set")))?;
+        out.push_str(value);
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -379,28 +573,40 @@ mod tests {
     fn validate_rejects_bad_values() {
         let cases: Vec<(&str, KafkaConfig)> = vec![
             ("brokers", KafkaConfig::new("  ")),
-            ("client_id", KafkaConfig {
-                client_id: String::new(),
-                ..KafkaConfig::default()
-            }),
-            ("group_id", KafkaConfig {
-                group_id: Some(" ".into()),
-                ..KafkaConfig::default()
-            }),
-            ("send_timeout_ms", KafkaConfig {
-                producer: ProducerSettings {
-                    send_timeout_ms: 0,
-                    ..ProducerSettings::default()
+            (
+                "client_id",
+                KafkaConfig {
+                    client_id: String::new(),
+                    ..KafkaConfig::default()
                 },
-                ..KafkaConfig::default()
-            }),
-            ("health.timeout_ms", KafkaConfig {
-                health: HealthSettings {
-                    timeout_ms: 0,
-                    ..HealthSettings::default()
+            ),
+            (
+                "group_id",
+                KafkaConfig {
+                    group_id: Some(" ".into()),
+                    ..KafkaConfig::default()
                 },
-                ..KafkaConfig::default()
-            }),
+            ),
+            (
+                "send_timeout_ms",
+                KafkaConfig {
+                    producer: ProducerSettings {
+                        send_timeout_ms: 0,
+                        ..ProducerSettings::default()
+                    },
+                    ..KafkaConfig::default()
+                },
+            ),
+            (
+                "health.timeout_ms",
+                KafkaConfig {
+                    health: HealthSettings {
+                        timeout_ms: 0,
+                        ..HealthSettings::default()
+                    },
+                    ..KafkaConfig::default()
+                },
+            ),
         ];
         for (field, config) in cases {
             let err = config.validate().unwrap_err();
@@ -439,8 +645,14 @@ mod tests {
         config.client_id = "api".into();
         config.properties.insert("x".into(), "shared".into());
         config.properties.insert("y".into(), "shared".into());
-        config.producer.properties.insert("y".into(), "producer".into());
-        config.consumer.properties.insert("y".into(), "consumer".into());
+        config
+            .producer
+            .properties
+            .insert("y".into(), "producer".into());
+        config
+            .consumer
+            .properties
+            .insert("y".into(), "consumer".into());
 
         let producer = config.client_properties(ClientRole::Producer);
         let consumer = config.client_properties(ClientRole::Consumer);
