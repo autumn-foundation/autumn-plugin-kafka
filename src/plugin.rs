@@ -1,6 +1,7 @@
 //! The plugin and its runtime.
 
 use std::borrow::Cow;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -16,7 +17,7 @@ use crate::config::KafkaConfig;
 use crate::consumer::{Consumer, run_consumer, validate_consumers};
 use crate::error::KafkaError;
 use crate::health::KafkaHealth;
-use crate::metrics::KafkaMetrics;
+use crate::metrics::{ConsumerCounters, KafkaMetrics};
 use crate::producer::KafkaProducer;
 use crate::rdkafka_backend::RdKafkaBackend;
 
@@ -163,15 +164,21 @@ pub struct KafkaRuntime {
 struct RuntimeInner {
     shutdown: CancellationToken,
     state: Mutex<RuntimeState>,
+    /// Consumer tasks. A task stays here until it is joined, so that a
+    /// `shutdown` call that was dropped can continue in the next call.
+    tasks: tokio::sync::Mutex<Vec<JoinHandle<()>>>,
 }
 
 #[derive(Default)]
 struct RuntimeState {
     started: bool,
     producer: Option<KafkaProducer>,
-    tasks: Vec<JoinHandle<()>>,
+    consumers: Vec<Arc<ConsumerCounters>>,
     shutdown_timeout: Duration,
 }
+
+/// The minimum time for the last producer flush.
+const MIN_FLUSH: Duration = Duration::from_millis(500);
 
 impl KafkaRuntime {
     pub(crate) fn new() -> Self {
@@ -186,38 +193,46 @@ impl KafkaRuntime {
         self.lock().producer.clone()
     }
 
-    /// Returns `true` after startup and before shutdown.
+    /// Returns `true` after startup, before shutdown, and while all consumers run.
     #[must_use]
     pub fn is_running(&self) -> bool {
-        self.lock().started && !self.inner.shutdown.is_cancelled()
+        let state = self.lock();
+        state.started
+            && !self.inner.shutdown.is_cancelled()
+            && state
+                .consumers
+                .iter()
+                .all(|c| c.running.load(Ordering::Relaxed))
     }
 
     /// Stops the consumers, then flushes the producer.
     ///
-    /// A consumer completes its current message first.
-    /// After `shutdown_timeout_ms`, the function stops the remaining tasks.
+    /// A consumer stops after its current handler call. It does not commit a
+    /// message that it did not complete. After `shutdown_timeout_ms`, the
+    /// function aborts the tasks that did not stop.
+    /// If the caller drops this future, the next call continues the work.
     /// It is safe to call more than one time.
     pub async fn shutdown(&self) {
         self.inner.shutdown.cancel();
-        let (tasks, producer, timeout) = {
-            let mut state = self.lock();
-            (
-                std::mem::take(&mut state.tasks),
-                state.producer.clone(),
-                state.shutdown_timeout,
-            )
+        let (producer, timeout) = {
+            let state = self.lock();
+            (state.producer.clone(), state.shutdown_timeout)
         };
         let deadline = tokio::time::Instant::now() + timeout;
-        for task in tasks {
-            let abort = task.abort_handle();
-            if tokio::time::timeout_at(deadline, task).await.is_err() {
-                abort.abort();
+        let mut tasks = self.inner.tasks.lock().await;
+        while let Some(task) = tasks.last_mut() {
+            if tokio::time::timeout_at(deadline, &mut *task).await.is_err() {
+                task.abort();
                 tracing::warn!("Kafka consumer did not stop in time; task aborted");
+                // Wait until the aborted task is dropped.
+                let _ = (&mut *task).await;
             }
+            tasks.pop();
         }
+        drop(tasks);
         if let Some(producer) = producer {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if let Err(error) = producer.flush(remaining).await {
+            if let Err(error) = producer.flush(remaining.max(MIN_FLUSH)).await {
                 tracing::warn!(%error, "Kafka producer flush failed at shutdown");
             }
         }
@@ -277,9 +292,16 @@ impl KafkaRuntime {
             tracing::warn!(%error, "Kafka health indicator not registered");
         }
 
+        let mut tasks = self
+            .inner
+            .tasks
+            .try_lock()
+            .map_err(|_| KafkaError::Config("the plugin is shutting down".to_owned()))?;
         for (consumer, client) in bound {
             let counters = metrics.consumer(consumer.name()).unwrap_or_default();
-            runtime.tasks.push(tokio::spawn(run_consumer(
+            counters.running.store(true, Ordering::Relaxed);
+            runtime.consumers.push(Arc::clone(&counters));
+            tasks.push(tokio::spawn(run_consumer(
                 client,
                 consumer,
                 producer.clone(),
@@ -291,13 +313,14 @@ impl KafkaRuntime {
         tracing::info!(
             brokers = %config.brokers,
             client_id = %config.client_id,
-            consumers = runtime.tasks.len(),
+            consumers = tasks.len(),
             "Kafka plugin started"
         );
         runtime.producer = Some(producer);
         runtime.shutdown_timeout = Duration::from_millis(config.shutdown_timeout_ms);
         runtime.started = true;
         drop(runtime);
+        drop(tasks);
         Ok(())
     }
 }
@@ -312,10 +335,9 @@ impl std::fmt::Debug for KafkaRuntime {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU32, Ordering};
-
     use autumn_web::actuator::{HealthStatus, IndicatorGroup};
     use futures::future::BoxFuture;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     use super::*;
     use crate::backend::{ConsumerBackend, ConsumerSpec, ProducerBackend};
