@@ -72,6 +72,16 @@ fn map_error(error: &RdKafkaError) -> KafkaError {
     }
 }
 
+/// Converts headers one by one. `get` can panic on a bad header; the function skips it.
+///
+/// Returns the headers and the number of skipped headers.
+fn collect_headers<F>(_count: usize, _get: F) -> (Vec<(String, Vec<u8>)>, usize)
+where
+    F: Fn(usize) -> Option<(String, Vec<u8>)>,
+{
+    todo!()
+}
+
 fn join_error(error: &tokio::task::JoinError) -> KafkaError {
     KafkaError::Client(format!("blocking task failed: {error}"))
 }
@@ -214,6 +224,8 @@ impl ConsumerBackend for RdConsumer {
 
 #[cfg(test)]
 mod tests {
+    use rdkafka::types::RDKafkaErrorCode;
+
     use super::*;
 
     fn spec() -> ConsumerSpec {
@@ -280,6 +292,64 @@ mod tests {
         assert_eq!(props["enable.auto.offset.store"], "false");
         assert_eq!(props["enable.auto.commit"], "true");
         assert_eq!(props["fetch.min.bytes"], "10");
+    }
+
+    #[test]
+    fn consumer_properties_default_to_earliest() {
+        let props = consumer_properties(&KafkaConfig::default(), &spec());
+        assert_eq!(props["auto.offset.reset"], "earliest");
+
+        let latest = spec().with_property("auto.offset.reset", "latest");
+        let props = consumer_properties(&KafkaConfig::default(), &latest);
+        assert_eq!(props["auto.offset.reset"], "latest");
+    }
+
+    #[test]
+    fn permanent_produce_errors_are_rejected() {
+        for code in [
+            RDKafkaErrorCode::MessageSizeTooLarge,
+            RDKafkaErrorCode::TopicAuthorizationFailed,
+            RDKafkaErrorCode::ClusterAuthorizationFailed,
+            RDKafkaErrorCode::InvalidRecord,
+            RDKafkaErrorCode::InvalidMessage,
+        ] {
+            let error = map_error(&RdKafkaError::MessageProduction(code));
+            assert!(
+                matches!(error, KafkaError::Rejected(_)),
+                "{code:?}: {error}"
+            );
+        }
+        let transient = map_error(&RdKafkaError::MessageProduction(
+            RDKafkaErrorCode::BrokerTransportFailure,
+        ));
+        assert!(matches!(transient, KafkaError::Client(_)), "{transient}");
+    }
+
+    #[test]
+    fn config_error_does_not_show_the_value() {
+        let mut config = KafkaConfig::default();
+        config
+            .properties
+            .insert("security.protocol".into(), "hunter2".into());
+
+        let err = RdKafkaBackend.producer(&config).err().unwrap().to_string();
+
+        assert!(err.contains("security.protocol"), "{err}");
+        assert!(!err.contains("hunter2"), "{err}");
+    }
+
+    #[test]
+    fn collect_headers_skips_a_header_that_panics() {
+        let (headers, skipped) = collect_headers(3, |i| {
+            assert_ne!(i, 1, "bad header key");
+            Some((format!("h{i}"), vec![u8::try_from(i).unwrap()]))
+        });
+
+        assert_eq!(skipped, 1);
+        assert_eq!(
+            headers,
+            vec![("h0".to_owned(), vec![0]), ("h2".to_owned(), vec![2])]
+        );
     }
 
     #[tokio::test]
