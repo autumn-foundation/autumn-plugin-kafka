@@ -35,7 +35,7 @@ pub trait Backend: Send + Sync + 'static {
 }
 
 /// The data that a backend needs to make one consumer.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ConsumerSpec {
     /// The consumer name.
@@ -69,6 +69,17 @@ impl ConsumerSpec {
     pub fn with_property(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.properties.insert(key.into(), value.into());
         self
+    }
+}
+
+impl std::fmt::Debug for ConsumerSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConsumerSpec")
+            .field("name", &self.name)
+            .field("group_id", &self.group_id)
+            .field("topics", &self.topics)
+            .field("properties", &crate::config::redacted(&self.properties))
+            .finish()
     }
 }
 

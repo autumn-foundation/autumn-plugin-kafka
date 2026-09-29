@@ -14,6 +14,9 @@ use crate::error::KafkaError;
 use crate::message::{Delivery, Record};
 use crate::metrics::KafkaMetrics;
 
+/// Extra time after the client send timeout.
+const SEND_MARGIN: Duration = Duration::from_millis(500);
+
 /// Sends records to Kafka. Clones share one client.
 ///
 /// Use it as a handler argument:
@@ -49,12 +52,15 @@ impl KafkaProducer {
     ///
     /// # Errors
     ///
-    /// Returns [`KafkaError::Timeout`] after `producer.send_timeout_ms`.
+    /// Returns [`KafkaError::Timeout`] after `producer.send_timeout_ms` plus 500 ms.
     /// The broker can still get the record after a timeout.
     /// Returns other errors from the client.
     pub async fn send(&self, record: Record) -> Result<Delivery, KafkaError> {
+        // The client timeout ends first. The margin lets the client report the
+        // result, so that a caller does not send again a record that the broker
+        // can still accept.
         let result = tokio::time::timeout(
-            self.send_timeout,
+            self.send_timeout + SEND_MARGIN,
             self.backend.send(record, self.send_timeout),
         )
         .await

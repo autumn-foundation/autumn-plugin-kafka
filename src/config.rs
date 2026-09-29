@@ -19,6 +19,8 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use autumn_web::config::{Env, normalize_profile_name, profile_override_file_lookup_names};
+use autumn_web::dotenv::resolve_dotenv_vars_in;
 use serde::Deserialize;
 
 use crate::error::KafkaError;
@@ -57,7 +59,7 @@ pub struct KafkaConfig {
 }
 
 /// Producer settings. Maps to `[kafka.producer]`.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 #[non_exhaustive]
 pub struct ProducerSettings {
@@ -68,7 +70,7 @@ pub struct ProducerSettings {
 }
 
 /// Consumer settings. Maps to `[kafka.consumer]`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 #[non_exhaustive]
 pub struct ConsumerSettings {
@@ -138,15 +140,39 @@ impl std::fmt::Debug for KafkaConfig {
     }
 }
 
+impl std::fmt::Debug for ProducerSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProducerSettings")
+            .field("properties", &redacted(&self.properties))
+            .field("send_timeout_ms", &self.send_timeout_ms)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for ConsumerSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConsumerSettings")
+            .field("properties", &redacted(&self.properties))
+            .finish()
+    }
+}
+
 /// Returns `true` if the property value can hold a secret.
 fn is_secret_key(key: &str) -> bool {
     let key = key.to_ascii_lowercase();
-    ["password", "secret", "ssl.key.pem", "oauthbearer.config"]
-        .iter()
-        .any(|part| key.contains(part))
+    [
+        "password",
+        "passphrase",
+        "secret",
+        "private.key",
+        "ssl.key.pem",
+        "oauthbearer.config",
+    ]
+    .iter()
+    .any(|part| key.contains(part))
 }
 
-fn redacted(map: &BTreeMap<String, String>) -> BTreeMap<&str, &str> {
+pub fn redacted(map: &BTreeMap<String, String>) -> BTreeMap<&str, &str> {
     map.iter()
         .map(|(k, v)| {
             let value = if is_secret_key(k) {
@@ -181,6 +207,7 @@ impl KafkaConfig {
         let root = parse_table(toml, "TOML input")?;
         let mut section = toml::Table::new();
         merge_section(&mut section, root.get("kafka"), "[kafka]")?;
+        check_property_types(&section)?;
         from_table(section)
     }
 
@@ -206,33 +233,74 @@ impl KafkaConfig {
     ///
     /// See [`load`](Self::load).
     pub fn load_with_env(profile: &str, env: &HashMap<String, String>) -> Result<Self, KafkaError> {
+        let normalized = normalize_profile_name(profile).unwrap_or_else(|| profile.to_owned());
+        let names = profile_override_file_lookup_names(&normalized, profile);
+        let env = with_dotenv(&normalized, env)?;
         let mut section = toml::Table::new();
 
-        if let Some(base) = read_file("autumn.toml", env)? {
+        if let Some(base) = read_file("autumn.toml", &env)? {
             merge_section(&mut section, base.get("kafka"), "[kafka]")?;
-            let inline = base
-                .get("profile")
-                .and_then(|p| p.get(profile))
-                .and_then(|p| p.get("kafka"));
-            merge_section(&mut section, inline, "[profile.<name>.kafka]")?;
+            for name in &names {
+                let inline = base
+                    .get("profile")
+                    .and_then(|p| p.get(name))
+                    .and_then(|p| p.get("kafka"));
+                merge_section(&mut section, inline, "[profile.<name>.kafka]")?;
+            }
         }
-        if let Some(file) = read_file(&format!("autumn-{profile}.toml"), env)? {
-            merge_section(&mut section, file.get("kafka"), "[kafka]")?;
+        for name in &names {
+            if let Some(file) = read_file(&format!("autumn-{name}.toml"), &env)? {
+                merge_section(&mut section, file.get("kafka"), "[kafka]")?;
+                break;
+            }
         }
 
-        interpolate_table(&mut section, env)?;
+        interpolate_table(&mut section, &env, "")?;
+        check_property_types(&section)?;
         let mut config = from_table(section)?;
+        config.apply_env_overrides(&env)?;
+        Ok(config)
+    }
 
+    /// Applies the `AUTUMN_KAFKA__*` variables.
+    fn apply_env_overrides(&mut self, env: &HashMap<String, String>) -> Result<(), KafkaError> {
         if let Some(v) = env.get("AUTUMN_KAFKA__BROKERS") {
-            config.brokers.clone_from(v);
+            self.brokers.clone_from(v);
         }
         if let Some(v) = env.get("AUTUMN_KAFKA__CLIENT_ID") {
-            config.client_id.clone_from(v);
+            self.client_id.clone_from(v);
         }
         if let Some(v) = env.get("AUTUMN_KAFKA__GROUP_ID") {
-            config.group_id = Some(v.clone());
+            self.group_id = Some(v.clone());
         }
-        Ok(config)
+        env_number(
+            env,
+            "AUTUMN_KAFKA__SHUTDOWN_TIMEOUT_MS",
+            &mut self.shutdown_timeout_ms,
+        )?;
+        env_number(
+            env,
+            "AUTUMN_KAFKA__PRODUCER__SEND_TIMEOUT_MS",
+            &mut self.producer.send_timeout_ms,
+        )?;
+        env_number(
+            env,
+            "AUTUMN_KAFKA__HEALTH__TIMEOUT_MS",
+            &mut self.health.timeout_ms,
+        )?;
+        if let Some(v) = env.get("AUTUMN_KAFKA__HEALTH__READINESS") {
+            self.health.readiness = match v.trim() {
+                "true" | "1" => true,
+                "false" | "0" => false,
+                _ => {
+                    return Err(env_error(
+                        "AUTUMN_KAFKA__HEALTH__READINESS",
+                        "true or false",
+                    ));
+                }
+            };
+        }
+        Ok(())
     }
 
     /// Makes sure that the config can work.
@@ -336,36 +404,137 @@ fn merge_tables(target: &mut toml::Table, layer: &toml::Table) {
     }
 }
 
+fn env_error(name: &str, expected: &str) -> KafkaError {
+    // The value can be a secret, so the message does not show it.
+    KafkaError::Config(format!("environment variable {name} must be {expected}"))
+}
+
+fn env_number(
+    env: &HashMap<String, String>,
+    name: &str,
+    target: &mut u64,
+) -> Result<(), KafkaError> {
+    if let Some(v) = env.get(name) {
+        *target = v
+            .trim()
+            .parse()
+            .map_err(|_| env_error(name, "a whole number"))?;
+    }
+    Ok(())
+}
+
+/// An Autumn [`Env`] view of a variable map.
+struct MapEnv<'a>(&'a HashMap<String, String>);
+
+impl Env for MapEnv<'_> {
+    fn var(&self, key: &str) -> Result<String, std::env::VarError> {
+        self.0
+            .get(key)
+            .cloned()
+            .ok_or(std::env::VarError::NotPresent)
+    }
+}
+
+/// Adds the `.env` variables that Autumn loads for `profile`. Real variables win.
+fn with_dotenv(
+    profile: &str,
+    env: &HashMap<String, String>,
+) -> Result<HashMap<String, String>, KafkaError> {
+    let dir = env.get("AUTUMN_MANIFEST_DIR").map_or_else(
+        || std::env::current_dir().unwrap_or_else(|_| ".".into()),
+        std::path::PathBuf::from,
+    );
+    let vars = resolve_dotenv_vars_in(&dir, profile, &MapEnv(env))
+        .map_err(|e| KafkaError::Config(format!(".env: {e}")))?;
+    let mut merged = env.clone();
+    for (key, value) in vars {
+        merged.entry(key).or_insert(value);
+    }
+    Ok(merged)
+}
+
+/// Makes sure that all property values are strings.
+///
+/// The error names the key, but not the value, because the value can be a secret.
+fn check_property_types(section: &toml::Table) -> Result<(), KafkaError> {
+    let tables = [
+        ("properties", section.get("properties")),
+        (
+            "producer.properties",
+            section.get("producer").and_then(|p| p.get("properties")),
+        ),
+        (
+            "consumer.properties",
+            section.get("consumer").and_then(|c| c.get("properties")),
+        ),
+    ];
+    for (path, table) in tables {
+        let Some(toml::Value::Table(table)) = table else {
+            continue;
+        };
+        for (key, value) in table {
+            if !value.is_str() {
+                return Err(KafkaError::Config(format!(
+                    "[kafka] {path}.{key:?} must be a string; put the value in quotes"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn interpolate_table(
     table: &mut toml::Table,
     env: &HashMap<String, String>,
+    path: &str,
 ) -> Result<(), KafkaError> {
-    for (_, value) in table.iter_mut() {
+    for (key, value) in table.iter_mut() {
+        let path = if path.is_empty() {
+            key.clone()
+        } else {
+            format!("{path}.{key}")
+        };
         match value {
-            toml::Value::String(s) => *s = interpolate(s, env)?,
-            toml::Value::Table(t) => interpolate_table(t, env)?,
+            toml::Value::String(s) => *s = interpolate(s, env, &path)?,
+            toml::Value::Table(t) => interpolate_table(t, env, &path)?,
             _ => {}
         }
     }
     Ok(())
 }
 
-/// Replaces each `${NAME}` in `text` with the variable `NAME`.
-fn interpolate(text: &str, env: &HashMap<String, String>) -> Result<String, KafkaError> {
+/// Replaces each `${NAME}` in `text` with the variable `NAME`. `$${` gives `${`.
+///
+/// Errors name the key at `path`, but not the value, because the value can be a secret.
+fn interpolate(
+    text: &str,
+    env: &HashMap<String, String>,
+    path: &str,
+) -> Result<String, KafkaError> {
+    let fail = |problem: &str| KafkaError::Config(format!("[kafka] {path}: {problem}"));
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
-    while let Some(start) = rest.find("${") {
+    while let Some(start) = rest.find('$') {
         out.push_str(&rest[..start]);
-        let after = &rest[start + 2..];
-        let end = after
-            .find('}')
-            .ok_or_else(|| KafkaError::Config(format!("unclosed \"${{\" in {text:?}")))?;
-        let name = &after[..end];
-        let value = env
-            .get(name)
-            .ok_or_else(|| KafkaError::Config(format!("environment variable {name} is not set")))?;
-        out.push_str(value);
-        rest = &after[end + 1..];
+        let tail = &rest[start..];
+        if let Some(after) = tail.strip_prefix("$${") {
+            out.push_str("${");
+            rest = after;
+        } else if let Some(after) = tail.strip_prefix("${") {
+            let end = after.find('}').ok_or_else(|| fail("unclosed \"${\""))?;
+            let name = &after[..end];
+            if name.is_empty() {
+                return Err(fail("empty variable name in \"${}\""));
+            }
+            let value = env
+                .get(name)
+                .ok_or_else(|| fail(&format!("environment variable {name} is not set")))?;
+            out.push_str(value);
+            rest = &after[end + 1..];
+        } else {
+            out.push('$');
+            rest = &tail[1..];
+        }
     }
     out.push_str(rest);
     Ok(out)
