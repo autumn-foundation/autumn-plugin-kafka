@@ -20,8 +20,13 @@ pub struct Record {
 impl Record {
     /// Makes a record with a payload and no key.
     #[must_use]
-    pub fn new(_topic: impl Into<String>, _payload: impl Into<Vec<u8>>) -> Self {
-        todo!()
+    pub fn new(topic: impl Into<String>, payload: impl Into<Vec<u8>>) -> Self {
+        Self {
+            topic: topic.into(),
+            key: None,
+            payload: Some(payload.into()),
+            headers: Vec::new(),
+        }
     }
 
     /// Makes a record with a JSON payload.
@@ -32,52 +37,60 @@ impl Record {
     ///
     /// Returns [`KafkaError::Json`] if `value` cannot be encoded.
     pub fn json<T: Serialize + ?Sized>(
-        _topic: impl Into<String>,
-        _value: &T,
+        topic: impl Into<String>,
+        value: &T,
     ) -> Result<Self, KafkaError> {
-        todo!()
+        let payload = serde_json::to_vec(value)?;
+        Ok(Self::new(topic, payload).header("content-type", "application/json"))
     }
 
     /// Makes a record with no payload (a tombstone) for a key.
     #[must_use]
-    pub fn tombstone(_topic: impl Into<String>, _key: impl Into<Vec<u8>>) -> Self {
-        todo!()
+    pub fn tombstone(topic: impl Into<String>, key: impl Into<Vec<u8>>) -> Self {
+        Self {
+            topic: topic.into(),
+            key: Some(key.into()),
+            payload: None,
+            headers: Vec::new(),
+        }
     }
 
     /// Sets the key.
     #[must_use]
-    pub fn key(self, _key: impl Into<Vec<u8>>) -> Self {
-        todo!()
+    pub fn key(mut self, key: impl Into<Vec<u8>>) -> Self {
+        self.key = Some(key.into());
+        self
     }
 
     /// Adds a header.
     #[must_use]
-    pub fn header(self, _name: impl Into<String>, _value: impl Into<Vec<u8>>) -> Self {
-        todo!()
+    pub fn header(mut self, name: impl Into<String>, value: impl Into<Vec<u8>>) -> Self {
+        self.headers.push((name.into(), value.into()));
+        self
     }
 
     /// Returns the topic.
     #[must_use]
     pub fn topic(&self) -> &str {
-        todo!()
+        &self.topic
     }
 
     /// Returns the key.
     #[must_use]
     pub fn key_bytes(&self) -> Option<&[u8]> {
-        todo!()
+        self.key.as_deref()
     }
 
     /// Returns the payload. `None` is a tombstone.
     #[must_use]
     pub fn payload(&self) -> Option<&[u8]> {
-        todo!()
+        self.payload.as_deref()
     }
 
     /// Returns all headers in order.
     #[must_use]
     pub fn headers(&self) -> &[Header] {
-        todo!()
+        &self.headers
     }
 }
 
@@ -105,92 +118,112 @@ pub struct Message {
 impl Message {
     /// Makes a message at partition 0, offset 0. Use it in tests.
     #[must_use]
-    pub fn new(_topic: impl Into<String>, _payload: impl Into<Vec<u8>>) -> Self {
-        todo!()
+    pub fn new(topic: impl Into<String>, payload: impl Into<Vec<u8>>) -> Self {
+        Self {
+            payload: Some(payload.into()),
+            ..Self::tombstone(topic)
+        }
     }
 
     /// Makes a message with no payload (a tombstone).
     #[must_use]
-    pub fn tombstone(_topic: impl Into<String>) -> Self {
-        todo!()
+    pub fn tombstone(topic: impl Into<String>) -> Self {
+        Self {
+            topic: topic.into(),
+            partition: 0,
+            offset: 0,
+            key: None,
+            payload: None,
+            headers: Vec::new(),
+            timestamp_ms: None,
+        }
     }
 
     /// Sets the partition and the offset.
     #[must_use]
-    pub const fn with_position(self, _partition: i32, _offset: i64) -> Self {
-        todo!()
+    pub const fn with_position(mut self, partition: i32, offset: i64) -> Self {
+        self.partition = partition;
+        self.offset = offset;
+        self
     }
 
     /// Sets the key.
     #[must_use]
-    pub fn with_key(self, _key: impl Into<Vec<u8>>) -> Self {
-        todo!()
+    pub fn with_key(mut self, key: impl Into<Vec<u8>>) -> Self {
+        self.key = Some(key.into());
+        self
     }
 
     /// Adds a header.
     #[must_use]
-    pub fn with_header(self, _name: impl Into<String>, _value: impl Into<Vec<u8>>) -> Self {
-        todo!()
+    pub fn with_header(mut self, name: impl Into<String>, value: impl Into<Vec<u8>>) -> Self {
+        self.headers.push((name.into(), value.into()));
+        self
     }
 
     /// Sets the timestamp in milliseconds since the Unix epoch.
     #[must_use]
-    pub const fn with_timestamp_ms(self, _timestamp_ms: i64) -> Self {
-        todo!()
+    pub const fn with_timestamp_ms(mut self, timestamp_ms: i64) -> Self {
+        self.timestamp_ms = Some(timestamp_ms);
+        self
     }
 
     /// Returns the topic.
     #[must_use]
     pub fn topic(&self) -> &str {
-        todo!()
+        &self.topic
     }
 
     /// Returns the partition.
     #[must_use]
     pub const fn partition(&self) -> i32 {
-        todo!()
+        self.partition
     }
 
     /// Returns the offset.
     #[must_use]
     pub const fn offset(&self) -> i64 {
-        todo!()
+        self.offset
     }
 
     /// Returns the key.
     #[must_use]
     pub fn key(&self) -> Option<&[u8]> {
-        todo!()
+        self.key.as_deref()
     }
 
     /// Returns the payload. A tombstone gives an empty slice.
     #[must_use]
     pub fn payload(&self) -> &[u8] {
-        todo!()
+        self.payload.as_deref().unwrap_or_default()
     }
 
     /// Returns `true` if the message has no payload.
     #[must_use]
     pub const fn is_tombstone(&self) -> bool {
-        todo!()
+        self.payload.is_none()
     }
 
     /// Returns all headers in order.
     #[must_use]
     pub fn headers(&self) -> &[Header] {
-        todo!()
+        &self.headers
     }
 
     /// Returns the last value of a header.
     #[must_use]
-    pub fn header(&self, _name: &str) -> Option<&[u8]> {
-        todo!()
+    pub fn header(&self, name: &str) -> Option<&[u8]> {
+        self.headers
+            .iter()
+            .rev()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_slice())
     }
 
     /// Returns the timestamp in milliseconds since the Unix epoch.
     #[must_use]
     pub const fn timestamp_ms(&self) -> Option<i64> {
-        todo!()
+        self.timestamp_ms
     }
 
     /// Decodes the payload as JSON.
@@ -199,7 +232,7 @@ impl Message {
     ///
     /// Returns [`KafkaError::Json`] if the payload is not valid for `T`.
     pub fn json<T: DeserializeOwned>(&self) -> Result<T, KafkaError> {
-        todo!()
+        Ok(serde_json::from_slice(self.payload())?)
     }
 }
 
@@ -230,7 +263,10 @@ mod tests {
         assert_eq!(record.key_bytes(), Some(&b"k"[..]));
         assert_eq!(
             record.headers(),
-            &[("a".to_owned(), b"1".to_vec()), ("b".to_owned(), b"2".to_vec())]
+            &[
+                ("a".to_owned(), b"1".to_vec()),
+                ("b".to_owned(), b"2".to_vec())
+            ]
         );
     }
 
