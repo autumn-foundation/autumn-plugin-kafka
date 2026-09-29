@@ -1,10 +1,11 @@
 //! The plugin and its runtime.
 
 use std::borrow::Cow;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use autumn_web::AppState;
+use autumn_web::actuator::HealthIndicator as _;
 use autumn_web::app::AppBuilder;
 use autumn_web::plugin::Plugin;
 use autumn_web::reexports::tokio_util::sync::CancellationToken;
@@ -12,8 +13,9 @@ use tokio::task::JoinHandle;
 
 use crate::backend::Backend;
 use crate::config::KafkaConfig;
-use crate::consumer::Consumer;
+use crate::consumer::{Consumer, run_consumer, validate_consumers};
 use crate::error::KafkaError;
+use crate::health::KafkaHealth;
 use crate::metrics::KafkaMetrics;
 use crate::producer::KafkaProducer;
 use crate::rdkafka_backend::RdKafkaBackend;
@@ -53,31 +55,39 @@ impl KafkaPlugin {
     /// Makes a plugin with the [`RdKafkaBackend`] and no consumers.
     #[must_use]
     pub fn new() -> Self {
-        todo!()
+        Self {
+            config: None,
+            backend: Arc::new(RdKafkaBackend),
+            consumers: Vec::new(),
+            runtime: KafkaRuntime::default(),
+        }
     }
 
     /// Uses this config. Then the plugin does not read `[kafka]`.
     #[must_use]
-    pub fn config(self, _config: KafkaConfig) -> Self {
-        todo!()
+    pub fn config(mut self, config: KafkaConfig) -> Self {
+        self.config = Some(config);
+        self
     }
 
     /// Uses another backend. For example, use [`MemoryBroker`](crate::MemoryBroker) in tests.
     #[must_use]
-    pub fn backend(self, _backend: impl Backend) -> Self {
-        todo!()
+    pub fn backend(mut self, backend: impl Backend) -> Self {
+        self.backend = Arc::new(backend);
+        self
     }
 
     /// Adds a consumer.
     #[must_use]
-    pub fn consumer(self, _consumer: Consumer) -> Self {
-        todo!()
+    pub fn consumer(mut self, consumer: Consumer) -> Self {
+        self.consumers.push(consumer);
+        self
     }
 
     /// Returns a handle to the runtime. Use it to stop the consumers in tests.
     #[must_use]
     pub fn runtime(&self) -> KafkaRuntime {
-        todo!()
+        self.runtime.clone()
     }
 }
 
@@ -101,8 +111,45 @@ impl Plugin for KafkaPlugin {
         Cow::Borrowed(PLUGIN_NAME)
     }
 
-    fn build(self, _app: AppBuilder) -> AppBuilder {
-        todo!()
+    fn build(self, app: AppBuilder) -> AppBuilder {
+        let Self {
+            config,
+            backend,
+            consumers,
+            runtime,
+        } = self;
+        let metrics = Arc::new(KafkaMetrics::new(consumers.iter().map(Consumer::name)));
+        // The startup hook is `Fn`, but it runs one time. It takes the parts on the first call.
+        let pending = Arc::new(Mutex::new(Some((config, consumers))));
+        let start_runtime = runtime.clone();
+        let start_metrics = Arc::clone(&metrics);
+
+        app.config_section("kafka")
+            .metrics_source("kafka", metrics)
+            .on_startup(move |state| {
+                let parts = pending
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take();
+                let runtime = start_runtime.clone();
+                let metrics = Arc::clone(&start_metrics);
+                let backend = Arc::clone(&backend);
+                async move {
+                    let Some((config, consumers)) = parts else {
+                        return Ok(());
+                    };
+                    let config = match config {
+                        Some(config) => config,
+                        None => KafkaConfig::load(state.profile())?,
+                    };
+                    runtime.start(&state, config, backend.as_ref(), consumers, &metrics)?;
+                    Ok(())
+                }
+            })
+            .on_shutdown(move || {
+                let runtime = runtime.clone();
+                async move { runtime.shutdown().await }
+            })
     }
 }
 
@@ -130,13 +177,13 @@ impl KafkaRuntime {
     /// Returns the producer, after startup.
     #[must_use]
     pub fn producer(&self) -> Option<KafkaProducer> {
-        todo!()
+        self.lock().producer.clone()
     }
 
     /// Returns `true` after startup and before shutdown.
     #[must_use]
     pub fn is_running(&self) -> bool {
-        todo!()
+        self.lock().started && !self.inner.shutdown.is_cancelled()
     }
 
     /// Stops the consumers, then flushes the producer.
@@ -145,19 +192,106 @@ impl KafkaRuntime {
     /// After `shutdown_timeout_ms`, the function stops the remaining tasks.
     /// It is safe to call more than one time.
     pub async fn shutdown(&self) {
-        todo!()
+        self.inner.shutdown.cancel();
+        let (tasks, producer, timeout) = {
+            let mut state = self.lock();
+            (
+                std::mem::take(&mut state.tasks),
+                state.producer.clone(),
+                state.shutdown_timeout,
+            )
+        };
+        let deadline = tokio::time::Instant::now() + timeout;
+        for task in tasks {
+            let abort = task.abort_handle();
+            if tokio::time::timeout_at(deadline, task).await.is_err() {
+                abort.abort();
+                tracing::warn!("Kafka consumer did not stop in time; task aborted");
+            }
+        }
+        if let Some(producer) = producer {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if let Err(error) = producer.flush(remaining).await {
+                tracing::warn!(%error, "Kafka producer flush failed at shutdown");
+            }
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, RuntimeState> {
+        // The state has no invariant that a panic can break.
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Starts the plugin parts. The startup hook calls this function.
     pub(crate) fn start(
         &self,
-        _state: &AppState,
-        _config: KafkaConfig,
-        _backend: &dyn Backend,
-        _consumers: Vec<Consumer>,
-        _metrics: &Arc<KafkaMetrics>,
+        state: &AppState,
+        config: KafkaConfig,
+        backend: &dyn Backend,
+        consumers: Vec<Consumer>,
+        metrics: &Arc<KafkaMetrics>,
     ) -> Result<(), KafkaError> {
-        todo!()
+        let mut runtime = self.lock();
+        if runtime.started {
+            return Err(KafkaError::Config(
+                "the plugin is already started".to_owned(),
+            ));
+        }
+        config.validate()?;
+        validate_consumers(&consumers, &config)?;
+
+        // Make all clients first. Then an error does not leave half the parts running.
+        let producer = KafkaProducer::new(
+            backend.producer(&config)?,
+            Duration::from_millis(config.producer.send_timeout_ms),
+            Arc::clone(metrics),
+        );
+        let mut bound = Vec::with_capacity(consumers.len());
+        for consumer in consumers {
+            let client = backend.consumer(&config, &consumer.spec(&config)?)?;
+            bound.push((consumer, client));
+        }
+
+        state.insert_extension(producer.clone());
+        let health = KafkaHealth::new(
+            producer.backend(),
+            Duration::from_millis(config.health.timeout_ms),
+            config.health.readiness,
+        );
+        let group = health.group();
+        if let Err(error) =
+            state
+                .health_indicator_registry()
+                .register("kafka", group, Arc::new(health))
+        {
+            tracing::warn!(%error, "Kafka health indicator not registered");
+        }
+
+        for (consumer, client) in bound {
+            let counters = metrics.consumer(consumer.name()).unwrap_or_default();
+            runtime.tasks.push(tokio::spawn(run_consumer(
+                client,
+                consumer,
+                producer.clone(),
+                state.clone(),
+                counters,
+                self.inner.shutdown.clone(),
+            )));
+        }
+        tracing::info!(
+            brokers = %config.brokers,
+            client_id = %config.client_id,
+            consumers = runtime.tasks.len(),
+            "Kafka plugin started"
+        );
+        runtime.producer = Some(producer);
+        runtime.shutdown_timeout = Duration::from_millis(config.shutdown_timeout_ms);
+        runtime.started = true;
+        drop(runtime);
+        Ok(())
     }
 }
 

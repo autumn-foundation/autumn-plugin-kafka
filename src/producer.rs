@@ -68,6 +68,18 @@ impl KafkaProducer {
         result
     }
 
+    /// Waits until all queued records are sent.
+    pub(crate) async fn flush(&self, timeout: Duration) -> Result<(), KafkaError> {
+        tokio::time::timeout(timeout, self.backend.flush(timeout))
+            .await
+            .unwrap_or(Err(KafkaError::Timeout))
+    }
+
+    /// Returns the producer backend. The health indicator uses it.
+    pub(crate) fn backend(&self) -> Arc<dyn ProducerBackend> {
+        Arc::clone(&self.backend)
+    }
+
     /// Returns the producer that the plugin installed, if the plugin started.
     #[must_use]
     pub fn from_state(state: &AppState) -> Option<Self> {
