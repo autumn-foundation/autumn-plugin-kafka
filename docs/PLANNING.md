@@ -16,6 +16,7 @@ Install the plugin with one line.
 - `on_startup` gets `AppState`. `on_shutdown` runs in reverse order.
 - `health_indicator` and `metrics_source` add to `/actuator/*`.
 - `MetricsSource::collect` must not do I/O.
+- `AppBuilder::health_indicator` reads the group at build time. Thus the startup hook registers the indicator on `AppState`, after it reads `[kafka]`.
 - `TestApp` runs startup hooks with `Handle::block_on`. It does not run shutdown hooks.
 - Config layers: `autumn.toml`, `[profile.<name>]`, `autumn-<profile>.toml`, `AUTUMN_*` env.
 - Third-party plugin crates use the name `autumn-plugin-<name>`.
@@ -103,5 +104,9 @@ Each cycle has a red commit, a green commit, and (if necessary) a refactor commi
 5. Consumer loop: success, retry, skip, dead-letter, panic, shutdown.
 6. `KafkaHealth`: not started, up, down, group.
 7. `KafkaMetrics`: families and labels.
-8. `KafkaPlugin`: wire all parts. Test with `TestApp`.
-9. `RdKafkaBackend`: tests against a real broker.
+8. `RdKafkaBackend`: tests against a real broker.
+9. `KafkaPlugin`: wire all parts. Test with `TestApp`.
+
+We did cycle 8 before cycle 9, because the plugin uses `RdKafkaBackend` as the default.
+Clippy found one bug that the tests did not find (the panic text was lost).
+We added a red test for it first. Then we fixed it.
