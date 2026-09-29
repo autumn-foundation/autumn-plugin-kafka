@@ -9,6 +9,7 @@ repository = "https://github.com/autumn-foundation/autumn-plugin-kafka"
 readme = "README.md"
 keywords = ["autumn", "kafka", "plugin", "messaging", "web"]
 categories = ["web-programming", "asynchronous"]
+include = ["src/**", "examples/**", "README.md", "LICENSE", "Cargo.toml"]
 
 [features]
 default = []
@@ -18,6 +19,7 @@ ssl-vendored = ["rdkafka/ssl-vendored"]
 gssapi = ["rdkafka/gssapi"]
 zstd = ["rdkafka/zstd"]
 dynamic-linking = ["rdkafka/dynamic-linking"]
+cmake-build = ["rdkafka/cmake-build"]
 
 [dependencies]
 autumn-web = { version = "0.7.0", default-features = false }

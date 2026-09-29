@@ -8,21 +8,33 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
+  # Pinned, so that a new lint in a new Rust release does not fail CI.
+  RUST_TOOLCHAIN: "1.94.1"
 
 jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
+      # `--all-targets` includes the examples.
       - run: cargo clippy --all-targets
       - run: cargo doc --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-targets
 
   test:
     runs-on: ubuntu-latest
@@ -31,13 +43,23 @@ jobs:
         image: apache/kafka:3.9.1
         ports:
           - 9092:9092
+        options: >-
+          --health-cmd "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092"
+          --health-interval 5s
+          --health-timeout 10s
+          --health-retries 20
     env:
       KAFKA_BROKERS: localhost:9092
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
-      - name: Wait for Kafka
-        run: timeout 60 bash -c 'until (echo > /dev/tcp/localhost/9092) 2>/dev/null; do sleep 1; done'
       - run: cargo test --all-targets
       - run: cargo test --doc
+      # The examples run their self-check, so that they cannot rot.
+      - name: Example self-check (memory broker)
+        run: cargo run --example orders -- --check --memory
+      - name: Example self-check (Kafka)
+        run: cargo run --example orders -- --check
