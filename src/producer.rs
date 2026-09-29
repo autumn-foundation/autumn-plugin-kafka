@@ -122,12 +122,16 @@ impl std::fmt::Debug for KafkaProducer {
 impl FromRequestParts<AppState> for KafkaProducer {
     type Rejection = AutumnError;
 
-    async fn from_request_parts(
+    fn from_request_parts(
         _parts: &mut Parts,
         state: &AppState,
-    ) -> Result<Self, Self::Rejection> {
-        Self::from_state(state)
-            .ok_or_else(|| AutumnError::service_unavailable_msg("Kafka producer is not started"))
+    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
+        // Nothing to wait for, so the future is ready at once.
+        std::future::ready(
+            Self::from_state(state).ok_or_else(|| {
+                AutumnError::service_unavailable_msg("Kafka producer is not started")
+            }),
+        )
     }
 }
 
