@@ -1164,6 +1164,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handler_can_return_autumn_result() {
+        async fn handle(_msg: Message, _state: AppState) -> autumn_web::AutumnResult<()> {
+            Err(autumn_web::AutumnError::internal_server_error_msg("db is down"))
+        }
+        let broker = MemoryBroker::new();
+        let consumer = base()
+            .max_retries(0)
+            .dead_letter_topic("in.dlq")
+            .handler(handle);
+        let h = Harness::start(&broker, consumer);
+
+        broker.publish(Record::new("in", "x"));
+
+        wait_until("commit", || h.committed() == Some(1)).await;
+        let dead = broker.messages("in.dlq");
+        let error = std::str::from_utf8(dead[0].header(DLQ_HEADER_ERROR).unwrap()).unwrap();
+        assert!(error.contains("db is down"), "{error}");
+        h.stop().await;
+    }
+
+    #[tokio::test]
     async fn long_errors_are_cut_in_the_dead_letter_header() {
         let broker = MemoryBroker::new();
         let consumer = base()

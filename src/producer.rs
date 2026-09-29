@@ -205,6 +205,17 @@ mod tests {
         assert_eq!(metrics.produce_errors.load(Ordering::Relaxed), 1);
     }
 
+    #[tokio::test]
+    async fn from_backend_makes_a_producer_for_tests() {
+        let broker = MemoryBroker::new();
+        let backend = broker.producer(&KafkaConfig::default()).unwrap();
+
+        let producer = KafkaProducer::from_backend(backend, Duration::from_secs(1));
+        producer.send(Record::new("t", "x")).await.unwrap();
+
+        assert_eq!(broker.messages("t").len(), 1);
+    }
+
     #[test]
     fn from_state_finds_the_installed_producer() {
         let state = AppState::detached();
