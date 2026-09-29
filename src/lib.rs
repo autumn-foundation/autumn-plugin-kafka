@@ -4,6 +4,7 @@ pub mod backend;
 pub mod config;
 mod consumer;
 pub mod error;
+mod health;
 mod memory;
 pub mod message;
 mod metrics;
