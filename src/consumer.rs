@@ -101,16 +101,19 @@ impl Consumer {
     }
 
     /// Sets the handler. The handler gets the message and the app state.
+    ///
+    /// The error type can be any type that has `Display`, for example
+    /// `AutumnError`, [`HandlerError`], or `String`.
     #[must_use]
     pub fn handler<F, Fut, E>(mut self, handler: F) -> Self
     where
         F: Fn(Message, AppState) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<(), E>> + Send + 'static,
-        E: Into<HandlerError>,
+        E: std::fmt::Display + Send + 'static,
     {
         self.handler = Some(Arc::new(move |msg, state| {
             let fut = handler(msg, state);
-            Box::pin(async move { fut.await.map_err(Into::into) })
+            Box::pin(async move { fut.await.map_err(|e| HandlerError::from(e.to_string())) })
         }));
         self
     }
@@ -1166,7 +1169,9 @@ mod tests {
     #[tokio::test]
     async fn handler_can_return_autumn_result() {
         async fn handle(_msg: Message, _state: AppState) -> autumn_web::AutumnResult<()> {
-            Err(autumn_web::AutumnError::internal_server_error_msg("db is down"))
+            Err(autumn_web::AutumnError::internal_server_error_msg(
+                "db is down",
+            ))
         }
         let broker = MemoryBroker::new();
         let consumer = base()

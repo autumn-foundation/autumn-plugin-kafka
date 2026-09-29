@@ -48,6 +48,17 @@ impl KafkaProducer {
         }
     }
 
+    /// Makes a producer from a backend. Use it in tests, for example with
+    /// [`MemoryBroker`](crate::MemoryBroker). The plugin makes its own producer.
+    #[must_use]
+    pub fn from_backend(backend: Arc<dyn ProducerBackend>, send_timeout: Duration) -> Self {
+        Self::new(
+            backend,
+            send_timeout,
+            Arc::new(KafkaMetrics::new(Vec::<String>::new())),
+        )
+    }
+
     /// Sends a record. Completes when the broker accepts it.
     ///
     /// # Errors
