@@ -107,3 +107,16 @@ pub trait ConsumerBackend: Send + 'static {
     /// Leaves the group and releases the client.
     fn close(self: Box<Self>) -> BoxFuture<'static, ()>;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spec_debug_redacts_secrets() {
+        let spec = ConsumerSpec::new("c", "g", ["t"]).with_property("sasl.password", "hunter2");
+        let text = format!("{spec:?}");
+        assert!(!text.contains("hunter2"), "{text}");
+        assert!(text.contains("sasl.password"), "{text}");
+    }
+}

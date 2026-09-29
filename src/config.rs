@@ -680,4 +680,192 @@ mod tests {
 
         assert_eq!(props["bootstrap.servers"], "other:2");
     }
+
+    fn dir_env(dir: &tempfile::TempDir, pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        let mut vars = env(pairs);
+        vars.insert(
+            "AUTUMN_MANIFEST_DIR".into(),
+            dir.path().to_str().unwrap().into(),
+        );
+        vars
+    }
+
+    #[test]
+    fn load_accepts_profile_aliases() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            "[profile.prod.kafka]\nclient_id = \"inline\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("autumn-production.toml"),
+            "[kafka]\ngroup_id = \"file\"\n",
+        )
+        .unwrap();
+
+        for profile in ["production", "prod", "PROD"] {
+            let config = KafkaConfig::load_with_env(profile, &dir_env(&dir, &[])).unwrap();
+            assert_eq!(config.client_id, "inline", "{profile}");
+            assert_eq!(config.group_id.as_deref(), Some("file"), "{profile}");
+        }
+    }
+
+    #[test]
+    fn load_applies_nested_env_overrides() {
+        let dir = tempfile::tempdir().unwrap();
+        let vars = dir_env(
+            &dir,
+            &[
+                ("AUTUMN_KAFKA__SHUTDOWN_TIMEOUT_MS", "500"),
+                ("AUTUMN_KAFKA__PRODUCER__SEND_TIMEOUT_MS", "250"),
+                ("AUTUMN_KAFKA__HEALTH__READINESS", "true"),
+                ("AUTUMN_KAFKA__HEALTH__TIMEOUT_MS", "300"),
+            ],
+        );
+
+        let config = KafkaConfig::load_with_env("dev", &vars).unwrap();
+
+        assert_eq!(config.shutdown_timeout_ms, 500);
+        assert_eq!(config.producer.send_timeout_ms, 250);
+        assert!(config.health.readiness);
+        assert_eq!(config.health.timeout_ms, 300);
+    }
+
+    #[test]
+    fn bad_env_override_names_the_variable_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let vars = dir_env(&dir, &[("AUTUMN_KAFKA__SHUTDOWN_TIMEOUT_MS", "s3cret")]);
+
+        let err = KafkaConfig::load_with_env("dev", &vars)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("AUTUMN_KAFKA__SHUTDOWN_TIMEOUT_MS"), "{err}");
+        assert!(!err.contains("s3cret"), "{err}");
+    }
+
+    #[test]
+    fn load_reads_dotenv_in_dev_under_real_env() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            "[kafka.properties]\n\"sasl.password\" = \"${KAFKA_PASSWORD}\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join(".env"),
+            "KAFKA_PASSWORD=from-dotenv\nAUTUMN_KAFKA__BROKERS=dotenv:1\n",
+        )
+        .unwrap();
+        let vars = dir_env(&dir, &[("AUTUMN_KAFKA__BROKERS", "real:1")]);
+
+        let config = KafkaConfig::load_with_env("dev", &vars).unwrap();
+
+        assert_eq!(config.properties["sasl.password"], "from-dotenv");
+        assert_eq!(config.brokers, "real:1");
+    }
+
+    #[test]
+    fn load_ignores_dotenv_in_prod() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".env"), "AUTUMN_KAFKA__BROKERS=dotenv:1\n").unwrap();
+
+        let config = KafkaConfig::load_with_env("prod", &dir_env(&dir, &[])).unwrap();
+
+        assert_eq!(config.brokers, "localhost:9092");
+    }
+
+    #[test]
+    fn interpolation_edge_cases() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |value: &str| {
+            std::fs::write(
+                dir.path().join("autumn.toml"),
+                format!("[kafka]\nclient_id = {value:?}\n"),
+            )
+            .unwrap();
+        };
+        let vars = dir_env(&dir, &[("A", "a"), ("B", "b")]);
+
+        write("${A}-${B}");
+        let config = KafkaConfig::load_with_env("dev", &vars).unwrap();
+        assert_eq!(config.client_id, "a-b");
+
+        write("$${A}");
+        let config = KafkaConfig::load_with_env("dev", &vars).unwrap();
+        assert_eq!(config.client_id, "${A}");
+
+        write("x${A-s3cret");
+        let err = KafkaConfig::load_with_env("dev", &vars)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("unclosed") && err.contains("client_id"),
+            "{err}"
+        );
+        assert!(!err.contains("s3cret"), "{err}");
+
+        write("${}");
+        let err = KafkaConfig::load_with_env("dev", &vars)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("empty"), "{err}");
+    }
+
+    #[test]
+    fn non_string_property_names_the_key_only() {
+        let err = KafkaConfig::from_toml_str("[kafka.properties]\n\"sasl.password\" = 482913\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("sasl.password"), "{err}");
+        assert!(!err.contains("482913"), "{err}");
+    }
+
+    #[test]
+    fn section_that_is_not_a_table_is_an_error() {
+        let err = KafkaConfig::from_toml_str("kafka = \"x\"\n").unwrap_err();
+        assert!(err.to_string().contains("must be a table"), "{err}");
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            "[profile.prod]\nkafka = 1\n",
+        )
+        .unwrap();
+        let err = KafkaConfig::load_with_env("prod", &dir_env(&dir, &[])).unwrap_err();
+        assert!(err.to_string().contains("must be a table"), "{err}");
+    }
+
+    #[test]
+    fn debug_redacts_every_secret_key_kind() {
+        let mut config = KafkaConfig::default();
+        for key in [
+            "ssl.key.pem",
+            "sasl.oauthbearer.config",
+            "SASL.PASSWORD",
+            "sasl.oauthbearer.assertion.private.key.pem",
+            "sasl.oauthbearer.assertion.private.key.passphrase",
+        ] {
+            config
+                .properties
+                .insert(key.into(), format!("hunter-{key}"));
+        }
+        config
+            .producer
+            .properties
+            .insert("sasl.password".into(), "hunter-p".into());
+        config
+            .consumer
+            .properties
+            .insert("sasl.password".into(), "hunter-c".into());
+
+        for text in [
+            format!("{config:?}"),
+            format!("{:?}", config.producer),
+            format!("{:?}", config.consumer),
+        ] {
+            assert!(!text.contains("hunter"), "{text}");
+        }
+    }
 }

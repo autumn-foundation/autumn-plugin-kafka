@@ -165,6 +165,26 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn send_waits_a_margin_past_the_client_timeout() {
+        let metrics = Arc::new(KafkaMetrics::new(Vec::<String>::new()));
+        let producer = KafkaProducer::new(
+            Arc::new(Stuck),
+            Duration::from_millis(100),
+            Arc::clone(&metrics),
+        );
+        let start = tokio::time::Instant::now();
+
+        let err = producer.send(Record::new("t", "x")).await.unwrap_err();
+
+        assert!(matches!(err, KafkaError::Timeout), "{err}");
+        assert!(
+            start.elapsed() >= Duration::from_millis(600),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn send_times_out() {
         let metrics = Arc::new(KafkaMetrics::new(Vec::<String>::new()));
         let producer = KafkaProducer::new(
