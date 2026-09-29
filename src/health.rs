@@ -25,7 +25,7 @@ pub struct KafkaHealth {
 }
 
 impl KafkaHealth {
-    /// Makes an indicator. If `readiness` is `true`, it also gates `/ready`.
+    /// Makes an indicator. If `readiness` is `true`, a failed check also fails `/ready`.
     pub fn new(
         producer: Arc<dyn ProducerBackend>,
         consumers: Vec<(String, Arc<ConsumerCounters>)>,

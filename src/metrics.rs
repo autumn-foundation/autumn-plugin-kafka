@@ -72,7 +72,7 @@ impl MetricsSource for KafkaMetrics {
             ),
             counter(
                 "kafka_produce_errors_total",
-                "Records that the broker did not accept",
+                "Sends that failed or timed out",
                 vec![sample(vec![], &self.produce_errors)],
             ),
         ];

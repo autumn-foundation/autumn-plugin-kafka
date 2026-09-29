@@ -25,7 +25,10 @@ use crate::message::{Delivery, Message, Record};
 /// `message.timeout.ms = producer.send_timeout_ms`, if the config does not set them.
 /// Consumers always use `enable.auto.offset.store = false` and
 /// `enable.auto.commit = true`. The plugin stores an offset only after the
-/// handler completes. Thus delivery is at-least-once.
+/// handler completes. Because of this, delivery is at-least-once.
+/// Consumers use `auto.offset.reset = earliest`, if the config does not set it.
+///
+/// The health probe asks for the metadata of all topics.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RdKafkaBackend;
 

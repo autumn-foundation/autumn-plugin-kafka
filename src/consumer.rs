@@ -1,4 +1,4 @@
-//! Consumer bindings and the receive loop.
+//! Consumers and the receive loop.
 
 use std::any::Any;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -39,21 +39,28 @@ pub const DLQ_HEADER_OFFSET: &str = "autumn.dlq.original-offset";
 /// Dead-letter header: the last handler error. Maximum 1024 bytes.
 pub const DLQ_HEADER_ERROR: &str = "autumn.dlq.error";
 
-/// A consumer binding: topics, a group, and a handler.
+/// A consumer: topics, a group, and a handler.
 ///
 /// The consumer processes one message at a time, in order.
-/// Delivery is at-least-once: a handler can see a message again after a restart.
+/// Delivery is at-least-once. A handler can get the same message again after a restart.
 ///
-/// ```rust,ignore
-/// Consumer::new("orders", ["orders.placed"])
+/// ```rust,no_run
+/// # use autumn_plugin_kafka::{Consumer, Message};
+/// # use autumn_web::prelude::*;
+/// # #[derive(serde::Deserialize)]
+/// # struct Order { id: u64 }
+/// # async fn bill(_order: Order) -> AutumnResult<()> { Ok(()) }
+/// let consumer = Consumer::new("orders", ["orders.placed"])
 ///     .group_id("billing")
 ///     .handler(|msg: Message, _state: AppState| async move {
 ///         let order: Order = msg.json()?;
 ///         bill(order).await
 ///     })
 ///     .max_retries(5)
-///     .dead_letter_topic("orders.placed.dlq")
+///     .dead_letter_topic("orders.placed.dlq");
 /// ```
+///
+/// To test a handler, call it with [`Message::new`] and `AppState::detached()`.
 #[derive(Clone)]
 pub struct Consumer {
     name: String,
@@ -67,7 +74,7 @@ pub struct Consumer {
 }
 
 impl Consumer {
-    /// Makes a binding. The name is the metrics label and must be unique.
+    /// Makes a consumer. The name is the metrics label and must be unique.
     #[must_use]
     pub fn new<I, S>(name: impl Into<String>, topics: I) -> Self
     where
@@ -148,11 +155,11 @@ impl Consumer {
         &self.name
     }
 
-    /// Returns the backend data for this binding.
+    /// Returns the backend data for this consumer.
     ///
     /// # Errors
     ///
-    /// Returns [`KafkaError::Config`] if the binding has no group.
+    /// Returns [`KafkaError::Config`] if the consumer has no group.
     pub(crate) fn spec(&self, config: &KafkaConfig) -> Result<ConsumerSpec, KafkaError> {
         let group_id = self
             .group_id
@@ -201,7 +208,7 @@ impl std::fmt::Debug for Consumer {
     }
 }
 
-/// Makes sure that all bindings can work together.
+/// Checks that all consumers can work together.
 ///
 /// # Errors
 ///
@@ -270,7 +277,7 @@ pub fn validate_consumers(consumers: &[Consumer], config: &KafkaConfig) -> Resul
             if let Some(other) = subscriptions.insert((group.clone(), topic.as_str()), name) {
                 return fail(format!(
                     "consumers {other:?} and {name:?} share group {group:?} and topic {topic:?}; \
-                     each would get only some partitions"
+                     each gets only some partitions"
                 ));
             }
         }
@@ -498,7 +505,7 @@ impl Worker<'_> {
                         offset = msg.offset(),
                         dead_letter_topic = topic,
                         %error,
-                        "Kafka handler failed after all retries; message dead-lettered"
+                        "Kafka handler failed after all retries; message sent to the dead-letter topic"
                     );
                     return Outcome::Done;
                 }
@@ -538,7 +545,7 @@ impl Worker<'_> {
                 partition = msg.partition(),
                 offset = msg.offset(),
                 %error,
-                "Kafka commit failed; the message can come again"
+                "Kafka commit failed; the consumer can receive the message again"
             );
         }
     }
@@ -712,7 +719,7 @@ mod tests {
     }
 
     #[test]
-    fn spec_uses_binding_group_first() {
+    fn spec_uses_consumer_group_first() {
         let config = KafkaConfig {
             group_id: Some("default".into()),
             ..KafkaConfig::default()
@@ -737,7 +744,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_bad_bindings() {
+    fn validate_rejects_bad_consumers() {
         let ok = || {
             Consumer::new("c", ["t"])
                 .group_id("g")

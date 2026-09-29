@@ -54,7 +54,7 @@ pub struct KafkaConfig {
     pub consumer: ConsumerSettings,
     /// Health indicator settings.
     pub health: HealthSettings,
-    /// Time to wait for consumers and the producer at shutdown. Default: 10000.
+    /// Maximum time for shutdown, in milliseconds. Default: 10000.
     pub shutdown_timeout_ms: u64,
 }
 
@@ -216,12 +216,17 @@ impl KafkaConfig {
     /// The layers are, from low to high priority:
     /// `autumn.toml`, `[profile.<profile>.kafka]`, `autumn-<profile>.toml`,
     /// and the `AUTUMN_KAFKA__*` environment variables.
-    /// Then the function replaces each `${NAME}` with the variable `NAME`.
+    /// The profile names `production` and `development` are the same as `prod` and `dev`.
+    ///
+    /// The function reads `.env` files as Autumn does. Real variables win.
+    /// It replaces each `${NAME}` in the files with the variable `NAME`. `$${` gives `${`.
+    /// Then it applies the environment variables.
     ///
     /// # Errors
     ///
     /// Returns [`KafkaError::Config`] if a file is not valid,
     /// or if a `${NAME}` variable is not set.
+    /// The error names the key, but not the value.
     pub fn load(profile: &str) -> Result<Self, KafkaError> {
         let env: HashMap<String, String> = std::env::vars().collect();
         Self::load_with_env(profile, &env)
@@ -321,7 +326,7 @@ impl KafkaConfig {
             .as_deref()
             .is_some_and(|g| g.trim().is_empty())
         {
-            return fail("group_id must not be blank");
+            return fail("group_id must not be empty");
         }
         if self.producer.send_timeout_ms == 0 {
             return fail("producer.send_timeout_ms must be greater than 0");

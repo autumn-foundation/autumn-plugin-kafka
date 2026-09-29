@@ -91,7 +91,7 @@ impl MemoryBroker {
             .copied()
     }
 
-    /// Simulates an outage. When not available, `send` and `ping` fail.
+    /// If `available` is `false`, `send` and `ping` fail. `publish` still works.
     pub fn set_available(&self, available: bool) {
         self.inner.lock().unavailable = !available;
     }

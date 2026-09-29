@@ -26,14 +26,21 @@ pub const PLUGIN_NAME: &str = "autumn-plugin-kafka";
 
 /// The Kafka plugin.
 ///
-/// ```rust,ignore
+/// ```rust,no_run
+/// # use autumn_plugin_kafka::{Consumer, HandlerError, KafkaPlugin, Message};
+/// # use autumn_web::prelude::*;
+/// # async fn on_order(_msg: Message, _state: AppState) -> Result<(), HandlerError> { Ok(()) }
+/// # #[autumn_web::main]
+/// # async fn main() {
 /// autumn_web::app()
-///     .plugin(
-///         KafkaPlugin::new()
-///             .consumer(Consumer::new("orders", ["orders.placed"]).handler(on_order)),
-///     )
+///     .plugin(KafkaPlugin::new().consumer(
+///         Consumer::new("orders", ["orders.placed"])
+///             .group_id("billing")
+///             .handler(on_order),
+///     ))
 ///     .run()
 ///     .await;
+/// # }
 /// ```
 ///
 /// At startup, the plugin:
@@ -45,6 +52,8 @@ pub const PLUGIN_NAME: &str = "autumn-plugin-kafka";
 /// 5. Starts one task for each consumer.
 ///
 /// At shutdown, it stops the consumers and flushes the producer.
+///
+/// A consumer that stops before shutdown makes the health check `DOWN`.
 pub struct KafkaPlugin {
     config: Option<KafkaConfig>,
     backend: Arc<dyn Backend>,
@@ -85,7 +94,10 @@ impl KafkaPlugin {
         self
     }
 
-    /// Returns a handle to the runtime. Use it to stop the consumers in tests.
+    /// Returns a handle to the runtime.
+    ///
+    /// Call it before you add the plugin to the app. `TestApp` does not run
+    /// shutdown hooks, so call [`KafkaRuntime::shutdown`] at the end of a test.
     #[must_use]
     pub fn runtime(&self) -> KafkaRuntime {
         self.runtime.clone()
@@ -264,7 +276,7 @@ impl KafkaRuntime {
         config.validate()?;
         validate_consumers(&consumers, config)?;
 
-        // Make all clients first. Then an error does not leave half the parts running.
+        // Make all clients first. If one fails, no part starts.
         let producer = KafkaProducer::new(
             backend.producer(config)?,
             Duration::from_millis(config.producer.send_timeout_ms),

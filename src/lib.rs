@@ -49,18 +49,22 @@
 //! | [`KafkaPlugin`] | Installs all parts. Reads `[kafka]` at startup. |
 //! | [`KafkaConfig`] | The `[kafka]` config section. |
 //! | [`KafkaProducer`] | Sends records. It is a handler argument. |
-//! | [`Consumer`] | A consumer binding with an async handler. |
+//! | [`Consumer`] | A consumer with an async handler. |
 //! | [`MemoryBroker`] | An in-memory broker for tests. |
 //! | [`RdKafkaBackend`] | The default client, `librdkafka`. |
 //!
-//! The plugin also adds the `kafka` health indicator and `kafka_*` counters
+//! The plugin also adds the `kafka` health indicator and `kafka_*` metrics
 //! to `/actuator/prometheus`.
 //!
 //! # Delivery
 //!
 //! Consumers are at-least-once. The plugin commits an offset only after the
-//! handler completes, or after the dead-letter send completes. Thus a handler
-//! must be safe to run again for the same message.
+//! handler completes, or after the dead-letter send completes.
+//! A handler can get the same message again. Make sure that this is safe.
+//!
+//! # Example
+//!
+//! `examples/orders.rs` uses all parts. CI runs its self-check.
 
 mod backend;
 mod config;

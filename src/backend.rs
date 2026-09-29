@@ -92,7 +92,7 @@ pub trait ProducerBackend: Send + Sync + 'static {
         timeout: Duration,
     ) -> BoxFuture<'_, Result<Delivery, KafkaError>>;
 
-    /// Makes sure that a broker replies.
+    /// Sends a metadata request. Returns `Ok` if a broker replies in time.
     fn ping(&self, timeout: Duration) -> BoxFuture<'_, Result<(), KafkaError>>;
 
     /// Waits until all queued records are sent.

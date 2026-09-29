@@ -21,12 +21,19 @@ const SEND_MARGIN: Duration = Duration::from_millis(500);
 ///
 /// Use it as a handler argument:
 ///
-/// ```rust,ignore
+/// ```rust,no_run
+/// # use autumn_plugin_kafka::{KafkaProducer, Record};
+/// # use autumn_web::prelude::*;
+/// # #[derive(serde::Serialize, serde::Deserialize)]
+/// # struct Order { id: u64 }
 /// #[post("/orders")]
 /// async fn create(producer: KafkaProducer, Json(order): Json<Order>) -> AutumnResult<()> {
-///     producer.send(Record::json("orders", &order)?.with_key(order.id.to_string())).await?;
+///     producer
+///         .send(Record::json("orders", &order)?.with_key(order.id.to_string()))
+///         .await?;
 ///     Ok(())
 /// }
+/// # fn main() {}
 /// ```
 #[derive(Clone)]
 pub struct KafkaProducer {
