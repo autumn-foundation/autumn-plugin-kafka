@@ -1,18 +1,22 @@
 //! Consumer bindings and the receive loop.
 
-use std::collections::BTreeMap;
+use std::any::Any;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use autumn_web::AppState;
 use autumn_web::reexports::tokio_util::sync::CancellationToken;
+use futures::FutureExt as _;
 use futures::future::BoxFuture;
 
 use crate::backend::{ConsumerBackend, ConsumerSpec};
 use crate::config::KafkaConfig;
 use crate::error::KafkaError;
-use crate::message::Message;
+use crate::message::{Message, Record};
 use crate::metrics::ConsumerCounters;
 use crate::producer::KafkaProducer;
 
@@ -63,62 +67,80 @@ pub struct Consumer {
 impl Consumer {
     /// Makes a binding. The name is the metrics label and must be unique.
     #[must_use]
-    pub fn new<I, S>(_name: impl Into<String>, _topics: I) -> Self
+    pub fn new<I, S>(name: impl Into<String>, topics: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        todo!()
+        Self {
+            name: name.into(),
+            topics: topics.into_iter().map(Into::into).collect(),
+            group_id: None,
+            properties: BTreeMap::new(),
+            handler: None,
+            max_retries: 3,
+            retry_backoff: Duration::from_millis(100),
+            dead_letter_topic: None,
+        }
     }
 
     /// Sets the consumer group. The default is `kafka.group_id`.
     #[must_use]
-    pub fn group_id(self, _group_id: impl Into<String>) -> Self {
-        todo!()
+    pub fn group_id(mut self, group_id: impl Into<String>) -> Self {
+        self.group_id = Some(group_id.into());
+        self
     }
 
     /// Sets a `librdkafka` property for this consumer only.
     #[must_use]
-    pub fn property(self, _key: impl Into<String>, _value: impl Into<String>) -> Self {
-        todo!()
+    pub fn property(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.properties.insert(key.into(), value.into());
+        self
     }
 
     /// Sets the handler. The handler gets the message and the app state.
     #[must_use]
-    pub fn handler<F, Fut, E>(self, _handler: F) -> Self
+    pub fn handler<F, Fut, E>(mut self, handler: F) -> Self
     where
         F: Fn(Message, AppState) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<(), E>> + Send + 'static,
         E: Into<HandlerError>,
     {
-        todo!()
+        self.handler = Some(Arc::new(move |msg, state| {
+            let fut = handler(msg, state);
+            Box::pin(async move { fut.await.map_err(Into::into) })
+        }));
+        self
     }
 
     /// Sets the number of retries after the first failure. Default: 3.
     #[must_use]
-    pub const fn max_retries(self, _max_retries: u32) -> Self {
-        todo!()
+    pub const fn max_retries(mut self, max_retries: u32) -> Self {
+        self.max_retries = max_retries;
+        self
     }
 
     /// Sets the first retry delay. The delay doubles for each retry,
     /// to a maximum of 30 seconds. Default: 100 ms.
     #[must_use]
-    pub const fn retry_backoff(self, _retry_backoff: Duration) -> Self {
-        todo!()
+    pub const fn retry_backoff(mut self, retry_backoff: Duration) -> Self {
+        self.retry_backoff = retry_backoff;
+        self
     }
 
     /// Sends failed messages to this topic after all retries.
     ///
     /// Without a dead-letter topic, the consumer logs an error and skips the message.
     #[must_use]
-    pub fn dead_letter_topic(self, _topic: impl Into<String>) -> Self {
-        todo!()
+    pub fn dead_letter_topic(mut self, topic: impl Into<String>) -> Self {
+        self.dead_letter_topic = Some(topic.into());
+        self
     }
 
     /// Returns the name.
     #[must_use]
     pub fn name(&self) -> &str {
-        todo!()
+        &self.name
     }
 
     /// Returns the backend data for this binding.
@@ -126,8 +148,29 @@ impl Consumer {
     /// # Errors
     ///
     /// Returns [`KafkaError::Config`] if the binding has no group.
-    pub(crate) fn spec(&self, _config: &KafkaConfig) -> Result<ConsumerSpec, KafkaError> {
-        todo!()
+    pub(crate) fn spec(&self, config: &KafkaConfig) -> Result<ConsumerSpec, KafkaError> {
+        let group_id = self
+            .group_id
+            .clone()
+            .or_else(|| config.group_id.clone())
+            .ok_or_else(|| {
+                KafkaError::Config(format!(
+                    "consumer {:?} has no group: set Consumer::group_id or kafka.group_id",
+                    self.name
+                ))
+            })?;
+        Ok(ConsumerSpec {
+            name: self.name.clone(),
+            group_id,
+            topics: self.topics.clone(),
+            properties: self.properties.clone(),
+        })
+    }
+
+    /// Returns the delay before retry number `attempt` (1-based).
+    fn backoff(&self, attempt: u32) -> Duration {
+        let factor = 2u32.saturating_pow(attempt.saturating_sub(1));
+        self.retry_backoff.saturating_mul(factor).min(MAX_BACKOFF)
     }
 }
 
@@ -151,32 +194,301 @@ impl std::fmt::Debug for Consumer {
 ///
 /// Returns [`KafkaError::Config`] with the first problem found.
 pub(crate) fn validate_consumers(
-    _consumers: &[Consumer],
-    _config: &KafkaConfig,
+    consumers: &[Consumer],
+    config: &KafkaConfig,
 ) -> Result<(), KafkaError> {
-    todo!()
+    let fail = |msg: String| Err(KafkaError::Config(msg));
+    let mut names = HashSet::new();
+    let mut subscriptions: HashMap<(String, &str), &str> = HashMap::new();
+    for c in consumers {
+        let name = &c.name;
+        if name.trim().is_empty() {
+            return fail("a consumer name must not be empty".to_owned());
+        }
+        if !names.insert(name.as_str()) {
+            return fail(format!("consumer name {name:?} is not unique"));
+        }
+        if c.topics.is_empty() || c.topics.iter().any(|t| t.trim().is_empty()) {
+            return fail(format!(
+                "consumer {name:?} needs a topic, and no topic can be empty"
+            ));
+        }
+        if c.handler.is_none() {
+            return fail(format!("consumer {name:?} has no handler"));
+        }
+        if let Some(dlq) = &c.dead_letter_topic {
+            if dlq.trim().is_empty() || c.topics.contains(dlq) {
+                return fail(format!(
+                    "consumer {name:?} has a bad dead-letter topic: it must not be empty \
+                     or one of its own topics"
+                ));
+            }
+        }
+        let group = c.spec(config)?.group_id;
+        if group.trim().is_empty() {
+            return fail(format!("consumer {name:?} has an empty group"));
+        }
+        for topic in &c.topics {
+            if let Some(other) = subscriptions.insert((group.clone(), topic.as_str()), name) {
+                return fail(format!(
+                    "consumers {other:?} and {name:?} share group {group:?} and topic {topic:?}; \
+                     each would get only some partitions"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Receives and processes messages until `shutdown` is cancelled.
 pub(crate) async fn run_consumer(
-    _backend: Box<dyn ConsumerBackend>,
-    _consumer: Consumer,
-    _producer: KafkaProducer,
-    _state: AppState,
-    _counters: Arc<ConsumerCounters>,
-    _shutdown: CancellationToken,
+    mut backend: Box<dyn ConsumerBackend>,
+    consumer: Consumer,
+    producer: KafkaProducer,
+    state: AppState,
+    counters: Arc<ConsumerCounters>,
+    shutdown: CancellationToken,
 ) {
-    todo!()
+    let Some(handler) = consumer.handler.clone() else {
+        tracing::error!(consumer = %consumer.name, "Kafka consumer has no handler");
+        backend.close().await;
+        return;
+    };
+    let worker = Worker {
+        consumer: &consumer,
+        handler,
+        producer: &producer,
+        state: &state,
+        counters: &counters,
+        shutdown: &shutdown,
+    };
+    tracing::info!(consumer = %consumer.name, topics = ?consumer.topics, "Kafka consumer started");
+    loop {
+        let received = tokio::select! {
+            biased;
+            () = shutdown.cancelled() => break,
+            received = backend.recv() => received,
+        };
+        match received {
+            Ok(msg) => {
+                if worker.process(&mut *backend, &msg).await == Outcome::Cancelled {
+                    break;
+                }
+            }
+            Err(error) => {
+                counters.receive_errors.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(consumer = %consumer.name, %error, "Kafka receive failed");
+                if sleep_or_cancel(RECEIVE_ERROR_BACKOFF, &shutdown).await {
+                    break;
+                }
+            }
+        }
+    }
+    backend.close().await;
+    tracing::info!(consumer = %consumer.name, "Kafka consumer stopped");
+}
+
+/// The longest retry delay.
+const MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// The delay after a receive error.
+const RECEIVE_ERROR_BACKOFF: Duration = Duration::from_secs(1);
+/// The maximum length of the error header, in bytes.
+const MAX_ERROR_HEADER_LEN: usize = 1024;
+
+#[derive(Debug, PartialEq, Eq)]
+enum Outcome {
+    /// The message is committed, or the commit failed and was logged.
+    Done,
+    /// Shutdown started before the commit.
+    Cancelled,
+}
+
+/// The parts that the loop uses to process one message.
+struct Worker<'a> {
+    consumer: &'a Consumer,
+    handler: Handler,
+    producer: &'a KafkaProducer,
+    state: &'a AppState,
+    counters: &'a ConsumerCounters,
+    shutdown: &'a CancellationToken,
+}
+
+impl Worker<'_> {
+    async fn process(&self, backend: &mut dyn ConsumerBackend, msg: &Message) -> Outcome {
+        let mut attempt = 0;
+        let error = loop {
+            match self.invoke(msg).await {
+                Ok(()) => {
+                    self.counters.consumed.fetch_add(1, Ordering::Relaxed);
+                    self.commit(backend, msg);
+                    return Outcome::Done;
+                }
+                Err(error) => {
+                    self.counters.handler_errors.fetch_add(1, Ordering::Relaxed);
+                    if attempt >= self.consumer.max_retries {
+                        break error;
+                    }
+                    attempt += 1;
+                    tracing::warn!(
+                        consumer = %self.consumer.name,
+                        topic = msg.topic(),
+                        partition = msg.partition(),
+                        offset = msg.offset(),
+                        attempt,
+                        %error,
+                        "Kafka handler failed; retry"
+                    );
+                    if sleep_or_cancel(self.consumer.backoff(attempt), self.shutdown).await {
+                        return Outcome::Cancelled;
+                    }
+                }
+            }
+        };
+
+        if let Some(topic) = &self.consumer.dead_letter_topic {
+            if self.dead_letter(topic, msg, &error).await == Outcome::Cancelled {
+                return Outcome::Cancelled;
+            }
+        } else {
+            self.counters.skipped.fetch_add(1, Ordering::Relaxed);
+            tracing::error!(
+                consumer = %self.consumer.name,
+                topic = msg.topic(),
+                partition = msg.partition(),
+                offset = msg.offset(),
+                %error,
+                "Kafka handler failed after all retries; message skipped"
+            );
+        }
+        self.commit(backend, msg);
+        Outcome::Done
+    }
+
+    /// Calls the handler. A panic becomes an error.
+    async fn invoke(&self, msg: &Message) -> Result<(), HandlerError> {
+        let call = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            (self.handler)(msg.clone(), self.state.clone())
+        }));
+        let fut = match call {
+            Ok(fut) => fut,
+            Err(panic) => return Err(panic_error(&panic)),
+        };
+        match AssertUnwindSafe(fut).catch_unwind().await {
+            Ok(result) => result,
+            Err(panic) => Err(panic_error(&panic)),
+        }
+    }
+
+    /// Sends the message to the dead-letter topic. Retries until success or shutdown.
+    async fn dead_letter(&self, topic: &str, msg: &Message, error: &HandlerError) -> Outcome {
+        let record = dead_letter_record(topic, &self.consumer.name, msg, error);
+        let mut attempt = 0;
+        loop {
+            match self.producer.send(record.clone()).await {
+                Ok(_) => {
+                    self.counters.dead_lettered.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        consumer = %self.consumer.name,
+                        topic = msg.topic(),
+                        partition = msg.partition(),
+                        offset = msg.offset(),
+                        dead_letter_topic = topic,
+                        %error,
+                        "Kafka handler failed after all retries; message dead-lettered"
+                    );
+                    return Outcome::Done;
+                }
+                Err(send_error) => {
+                    attempt += 1;
+                    tracing::error!(
+                        consumer = %self.consumer.name,
+                        dead_letter_topic = topic,
+                        error = %send_error,
+                        "Kafka dead-letter send failed; retry"
+                    );
+                    if sleep_or_cancel(self.consumer.backoff(attempt), self.shutdown).await {
+                        return Outcome::Cancelled;
+                    }
+                }
+            }
+        }
+    }
+
+    fn commit(&self, backend: &mut dyn ConsumerBackend, msg: &Message) {
+        if let Err(error) = backend.commit(msg) {
+            tracing::error!(
+                consumer = %self.consumer.name,
+                topic = msg.topic(),
+                partition = msg.partition(),
+                offset = msg.offset(),
+                %error,
+                "Kafka commit failed; the message can come again"
+            );
+        }
+    }
+}
+
+fn dead_letter_record(topic: &str, consumer: &str, msg: &Message, error: &HandlerError) -> Record {
+    let mut record = if msg.is_tombstone() {
+        Record::tombstone(topic, msg.key().unwrap_or_default())
+    } else {
+        let record = Record::new(topic, msg.payload());
+        match msg.key() {
+            Some(key) => record.key(key),
+            None => record,
+        }
+    };
+    for (name, value) in msg.headers() {
+        record = record.header(name.clone(), value.clone());
+    }
+    record
+        .header(DLQ_HEADER_CONSUMER, consumer)
+        .header(DLQ_HEADER_TOPIC, msg.topic())
+        .header(DLQ_HEADER_PARTITION, msg.partition().to_string())
+        .header(DLQ_HEADER_OFFSET, msg.offset().to_string())
+        .header(
+            DLQ_HEADER_ERROR,
+            truncate(&error.to_string(), MAX_ERROR_HEADER_LEN),
+        )
+}
+
+/// Cuts `text` to at most `max` bytes, on a character boundary.
+fn truncate(text: &str, max: usize) -> &str {
+    if text.len() <= max {
+        return text;
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+fn panic_error(panic: &(dyn Any + Send)) -> HandlerError {
+    let detail = panic
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_owned())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".to_owned());
+    format!("handler panicked: {detail}").into()
+}
+
+/// Sleeps for `delay`. Returns `true` if shutdown started first.
+async fn sleep_or_cancel(delay: Duration, shutdown: &CancellationToken) -> bool {
+    tokio::select! {
+        biased;
+        () = shutdown.cancelled() => true,
+        () = tokio::time::sleep(delay) => false,
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::AtomicU32;
 
     use super::*;
     use crate::backend::Backend;
     use crate::memory::MemoryBroker;
-    use crate::message::Record;
     use crate::metrics::KafkaMetrics;
 
     const GROUP: &str = "g";
