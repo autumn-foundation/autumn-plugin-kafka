@@ -142,7 +142,7 @@ impl Plugin for KafkaPlugin {
                         Some(config) => config,
                         None => KafkaConfig::load(state.profile())?,
                     };
-                    runtime.start(&state, config, backend.as_ref(), consumers, &metrics)?;
+                    runtime.start(&state, &config, backend.as_ref(), consumers, &metrics)?;
                     Ok(())
                 }
             })
@@ -229,7 +229,7 @@ impl KafkaRuntime {
     pub(crate) fn start(
         &self,
         state: &AppState,
-        config: KafkaConfig,
+        config: &KafkaConfig,
         backend: &dyn Backend,
         consumers: Vec<Consumer>,
         metrics: &Arc<KafkaMetrics>,
@@ -241,17 +241,17 @@ impl KafkaRuntime {
             ));
         }
         config.validate()?;
-        validate_consumers(&consumers, &config)?;
+        validate_consumers(&consumers, config)?;
 
         // Make all clients first. Then an error does not leave half the parts running.
         let producer = KafkaProducer::new(
-            backend.producer(&config)?,
+            backend.producer(config)?,
             Duration::from_millis(config.producer.send_timeout_ms),
             Arc::clone(metrics),
         );
         let mut bound = Vec::with_capacity(consumers.len());
         for consumer in consumers {
-            let client = backend.consumer(&config, &consumer.spec(&config)?)?;
+            let client = backend.consumer(config, &consumer.spec(config)?)?;
             bound.push((consumer, client));
         }
 
@@ -355,7 +355,7 @@ mod tests {
         runtime
             .start(
                 &state,
-                KafkaConfig::default(),
+                &KafkaConfig::default(),
                 &broker,
                 vec![],
                 &metrics(&[]),
@@ -380,7 +380,7 @@ mod tests {
         let err = runtime
             .start(
                 &state,
-                KafkaConfig::new(""),
+                &KafkaConfig::new(""),
                 &MemoryBroker::new(),
                 vec![],
                 &metrics(&[]),
@@ -401,7 +401,7 @@ mod tests {
         let err = runtime
             .start(
                 &AppState::detached(),
-                KafkaConfig::default(),
+                &KafkaConfig::default(),
                 &MemoryBroker::new(),
                 consumers,
                 &m,
@@ -419,7 +419,7 @@ mod tests {
         runtime
             .start(
                 &state,
-                KafkaConfig::default(),
+                &KafkaConfig::default(),
                 &broker,
                 vec![],
                 &metrics(&[]),
@@ -429,7 +429,7 @@ mod tests {
         let err = runtime
             .start(
                 &state,
-                KafkaConfig::default(),
+                &KafkaConfig::default(),
                 &broker,
                 vec![],
                 &metrics(&[]),
@@ -450,7 +450,7 @@ mod tests {
         runtime
             .start(
                 &AppState::detached(),
-                KafkaConfig::default(),
+                &KafkaConfig::default(),
                 &broker,
                 consumers,
                 &m,
@@ -484,7 +484,7 @@ mod tests {
             ..KafkaConfig::default()
         };
         runtime
-            .start(&AppState::detached(), config, &broker, consumers, &m)
+            .start(&AppState::detached(), &config, &broker, consumers, &m)
             .unwrap();
         broker.publish(Record::new("in", "x"));
         tokio::time::sleep(Duration::from_millis(50)).await;
