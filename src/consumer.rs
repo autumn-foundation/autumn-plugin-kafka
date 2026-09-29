@@ -844,6 +844,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn panic_text_goes_to_the_dead_letter_header() {
+        let broker = MemoryBroker::new();
+        let consumer = base()
+            .max_retries(0)
+            .dead_letter_topic("in.dlq")
+            .handler(|_, _| async {
+                let detail = String::from("detail 42");
+                panic!("{detail}");
+                #[allow(unreachable_code)]
+                Ok::<_, HandlerError>(())
+            });
+        let h = Harness::start(&broker, consumer);
+
+        broker.publish(Record::new("in", "x"));
+
+        wait_until("commit", || h.committed() == Some(1)).await;
+        let dead = broker.messages("in.dlq");
+        let error = std::str::from_utf8(dead[0].header(DLQ_HEADER_ERROR).unwrap()).unwrap();
+        assert_eq!(error, "handler panicked: detail 42");
+        h.stop().await;
+    }
+
+    #[tokio::test]
     async fn sync_panic_in_handler_call_is_a_failure() {
         let broker = MemoryBroker::new();
         let consumer =
