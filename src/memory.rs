@@ -1,9 +1,11 @@
 //! An in-memory broker for tests.
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::future::BoxFuture;
+use tokio::sync::Notify;
 
 use crate::backend::{Backend, ConsumerBackend, ConsumerSpec, ProducerBackend};
 use crate::config::KafkaConfig;
@@ -18,39 +20,105 @@ use crate::message::{Delivery, Message, Record};
 /// Clones share the same data.
 #[derive(Clone, Default)]
 pub struct MemoryBroker {
-    _inner: Arc<()>,
+    inner: Arc<Inner>,
+}
+
+#[derive(Default)]
+struct Inner {
+    state: Mutex<State>,
+    notify: Notify,
+}
+
+#[derive(Default)]
+struct State {
+    topics: HashMap<String, Vec<Message>>,
+    /// The next offset to read, for each (group, topic).
+    committed: HashMap<(String, String), i64>,
+    unavailable: bool,
+}
+
+impl Inner {
+    fn lock(&self) -> MutexGuard<'_, State> {
+        // A panic cannot leave `State` half-changed, so a poisoned lock is safe to use.
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 impl MemoryBroker {
     /// Makes an empty broker.
     #[must_use]
     pub fn new() -> Self {
-        todo!()
+        Self::default()
     }
 
     /// Adds a record to its topic. Returns its position.
-    pub fn publish(&self, _record: Record) -> Delivery {
-        todo!()
+    #[allow(clippy::missing_panics_doc)] // The offset cannot exceed `i64::MAX`.
+    pub fn publish(&self, record: Record) -> Delivery {
+        let mut state = self.inner.lock();
+        let log = state.topics.entry(record.topic().to_owned()).or_default();
+        let offset = i64::try_from(log.len()).expect("offset fits in i64");
+        log.push(to_message(record, offset));
+        drop(state);
+        self.inner.notify.notify_waiters();
+        Delivery {
+            partition: 0,
+            offset,
+        }
     }
 
     /// Returns all messages in a topic.
     #[must_use]
-    pub fn messages(&self, _topic: &str) -> Vec<Message> {
-        todo!()
+    pub fn messages(&self, topic: &str) -> Vec<Message> {
+        self.inner
+            .lock()
+            .topics
+            .get(topic)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Returns the next offset that the group will read in the topic.
     ///
     /// Returns `None` if the group did not commit in the topic.
     #[must_use]
-    pub fn committed_offset(&self, _group_id: &str, _topic: &str) -> Option<i64> {
-        todo!()
+    pub fn committed_offset(&self, group_id: &str, topic: &str) -> Option<i64> {
+        self.inner
+            .lock()
+            .committed
+            .get(&(group_id.to_owned(), topic.to_owned()))
+            .copied()
     }
 
     /// Simulates an outage. When not available, `send` and `ping` fail.
-    pub fn set_available(&self, _available: bool) {
-        todo!()
+    pub fn set_available(&self, available: bool) {
+        self.inner.lock().unavailable = !available;
     }
+
+    fn check_available(&self) -> Result<(), KafkaError> {
+        if self.inner.lock().unavailable {
+            return Err(KafkaError::Unavailable("memory broker is down".to_owned()));
+        }
+        Ok(())
+    }
+}
+
+fn to_message(record: Record, offset: i64) -> Message {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+    let mut msg = match record.payload() {
+        Some(payload) => Message::new(record.topic(), payload),
+        None => Message::tombstone(record.topic()),
+    }
+    .with_position(0, offset)
+    .with_timestamp_ms(now_ms);
+    if let Some(key) = record.key_bytes() {
+        msg = msg.with_key(key);
+    }
+    for (name, value) in record.headers() {
+        msg = msg.with_header(name.clone(), value.clone());
+    }
+    msg
 }
 
 impl std::fmt::Debug for MemoryBroker {
@@ -61,15 +129,109 @@ impl std::fmt::Debug for MemoryBroker {
 
 impl Backend for MemoryBroker {
     fn producer(&self, _config: &KafkaConfig) -> Result<Arc<dyn ProducerBackend>, KafkaError> {
-        todo!()
+        Ok(Arc::new(self.clone()))
     }
 
     fn consumer(
         &self,
         _config: &KafkaConfig,
-        _spec: &ConsumerSpec,
+        spec: &ConsumerSpec,
     ) -> Result<Box<dyn ConsumerBackend>, KafkaError> {
-        todo!()
+        let state = self.inner.lock();
+        let positions = spec
+            .topics
+            .iter()
+            .map(|topic| {
+                let key = (spec.group_id.clone(), topic.clone());
+                (
+                    topic.clone(),
+                    state.committed.get(&key).copied().unwrap_or(0),
+                )
+            })
+            .collect();
+        Ok(Box::new(MemoryConsumer {
+            broker: self.clone(),
+            group_id: spec.group_id.clone(),
+            positions,
+        }))
+    }
+}
+
+impl ProducerBackend for MemoryBroker {
+    fn send(
+        &self,
+        record: Record,
+        _timeout: Duration,
+    ) -> BoxFuture<'_, Result<Delivery, KafkaError>> {
+        let result = self.check_available().map(|()| self.publish(record));
+        Box::pin(async move { result })
+    }
+
+    fn ping(&self, _timeout: Duration) -> BoxFuture<'_, Result<(), KafkaError>> {
+        let result = self.check_available();
+        Box::pin(async move { result })
+    }
+
+    fn flush(&self, _timeout: Duration) -> BoxFuture<'_, Result<(), KafkaError>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// A consumer of a [`MemoryBroker`].
+struct MemoryConsumer {
+    broker: MemoryBroker,
+    group_id: String,
+    /// The next offset to read, for each topic. The order is the subscription order.
+    positions: Vec<(String, i64)>,
+}
+
+impl MemoryConsumer {
+    fn try_next(&mut self) -> Option<Message> {
+        let state = self.broker.inner.lock();
+        for (topic, position) in &mut self.positions {
+            let index = usize::try_from(*position).unwrap_or(usize::MAX);
+            if let Some(msg) = state
+                .topics
+                .get(topic.as_str())
+                .and_then(|log| log.get(index))
+            {
+                *position += 1;
+                return Some(msg.clone());
+            }
+        }
+        None
+    }
+}
+
+impl ConsumerBackend for MemoryConsumer {
+    fn recv(&mut self) -> BoxFuture<'_, Result<Message, KafkaError>> {
+        let inner = Arc::clone(&self.broker.inner);
+        Box::pin(async move {
+            loop {
+                let notified = inner.notify.notified();
+                tokio::pin!(notified);
+                // Register before the check, so that no publish is missed.
+                notified.as_mut().enable();
+                if let Some(msg) = self.try_next() {
+                    return Ok(msg);
+                }
+                notified.await;
+            }
+        })
+    }
+
+    fn commit(&mut self, message: &Message) -> Result<(), KafkaError> {
+        let key = (self.group_id.clone(), message.topic().to_owned());
+        self.broker
+            .inner
+            .lock()
+            .committed
+            .insert(key, message.offset() + 1);
+        Ok(())
+    }
+
+    fn close(self: Box<Self>) -> BoxFuture<'static, ()> {
+        Box::pin(async {})
     }
 }
 
@@ -111,8 +273,20 @@ mod tests {
         let first = producer.send(Record::new("t", "a"), WAIT).await.unwrap();
         let second = producer.send(Record::new("t", "b"), WAIT).await.unwrap();
 
-        assert_eq!(first, Delivery { partition: 0, offset: 0 });
-        assert_eq!(second, Delivery { partition: 0, offset: 1 });
+        assert_eq!(
+            first,
+            Delivery {
+                partition: 0,
+                offset: 0
+            }
+        );
+        assert_eq!(
+            second,
+            Delivery {
+                partition: 0,
+                offset: 1
+            }
+        );
         let stored = broker.messages("t");
         assert_eq!(stored.len(), 2);
         assert_eq!(stored[1].payload(), b"b");
@@ -216,7 +390,10 @@ mod tests {
 
         broker.set_available(false);
 
-        let err = producer.send(Record::new("t", "x"), WAIT).await.unwrap_err();
+        let err = producer
+            .send(Record::new("t", "x"), WAIT)
+            .await
+            .unwrap_err();
         assert!(matches!(err, KafkaError::Unavailable(_)), "{err}");
         assert!(producer.ping(WAIT).await.is_err());
         assert!(broker.messages("t").is_empty());

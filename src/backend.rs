@@ -50,7 +50,11 @@ pub struct ConsumerSpec {
 /// Sends records.
 pub trait ProducerBackend: Send + Sync + 'static {
     /// Sends one record. Completes when the broker accepts it.
-    fn send(&self, record: Record, timeout: Duration) -> BoxFuture<'_, Result<Delivery, KafkaError>>;
+    fn send(
+        &self,
+        record: Record,
+        timeout: Duration,
+    ) -> BoxFuture<'_, Result<Delivery, KafkaError>>;
 
     /// Makes sure that a broker replies.
     fn ping(&self, timeout: Duration) -> BoxFuture<'_, Result<(), KafkaError>>;
