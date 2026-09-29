@@ -9,6 +9,7 @@ mod memory;
 pub mod message;
 mod metrics;
 mod producer;
+mod rdkafka_backend;
 
 pub use backend::{Backend, ConsumerBackend, ConsumerSpec, ProducerBackend};
 pub use config::{ClientRole, KafkaConfig};
@@ -20,3 +21,4 @@ pub use error::KafkaError;
 pub use memory::MemoryBroker;
 pub use message::{Delivery, Header, Message, Record};
 pub use producer::KafkaProducer;
+pub use rdkafka_backend::RdKafkaBackend;
