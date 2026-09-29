@@ -7,7 +7,7 @@ use autumn_web::actuator::{MetricFamily, MetricKind, MetricSample, MetricsSource
 
 /// Counters for one consumer.
 #[derive(Debug, Default)]
-pub(crate) struct ConsumerCounters {
+pub struct ConsumerCounters {
     /// Messages that the handler processed.
     pub consumed: AtomicU64,
     /// Handler attempts that failed.
@@ -22,7 +22,7 @@ pub(crate) struct ConsumerCounters {
 
 /// All plugin counters. Registered as the metrics source `kafka`.
 #[derive(Debug, Default)]
-pub(crate) struct KafkaMetrics {
+pub struct KafkaMetrics {
     /// Records that the broker accepted.
     pub produced: AtomicU64,
     /// Records that the broker did not accept.
@@ -69,7 +69,7 @@ impl MetricsSource for KafkaMetrics {
                 vec![sample(vec![], &self.produce_errors)],
             ),
         ];
-        let per_consumer: [(&str, &str, fn(&ConsumerCounters) -> &AtomicU64); 5] = [
+        let per_consumer: [(&str, &str, CounterField); 5] = [
             (
                 "kafka_messages_consumed_total",
                 "Messages that the handler processed",
@@ -110,6 +110,9 @@ impl MetricsSource for KafkaMetrics {
     }
 }
 
+/// Selects one counter of a consumer.
+type CounterField = fn(&ConsumerCounters) -> &AtomicU64;
+
 fn counter(name: &str, help: &str, samples: Vec<MetricSample>) -> MetricFamily {
     MetricFamily {
         name: name.to_owned(),
@@ -142,9 +145,10 @@ mod tests {
         family
             .samples
             .iter()
-            .find(|s| match consumer {
-                None => s.labels.is_empty(),
-                Some(c) => s.labels == [("consumer".to_owned(), c.to_owned())],
+            .find(|s| {
+                consumer.map_or(s.labels.is_empty(), |c| {
+                    s.labels == [("consumer".to_owned(), c.to_owned())]
+                })
             })
             .map(|s| s.value)
             .expect("a sample")
