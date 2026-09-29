@@ -55,6 +55,16 @@ impl Record {
         }
     }
 
+    /// Makes a tombstone with no key. Kafka rejects it on a compacted topic.
+    pub(crate) fn keyless_tombstone(topic: impl Into<String>) -> Self {
+        Self {
+            topic: topic.into(),
+            key: None,
+            payload: None,
+            headers: Vec::new(),
+        }
+    }
+
     /// Sets the key.
     #[must_use]
     pub fn with_key(mut self, key: impl Into<Vec<u8>>) -> Self {

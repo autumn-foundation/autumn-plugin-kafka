@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use autumn_web::actuator::{HealthCheckOutput, HealthIndicator, IndicatorGroup};
@@ -47,12 +48,23 @@ impl HealthIndicator for KafkaHealth {
             let result = tokio::time::timeout(self.probe_timeout, probe)
                 .await
                 .unwrap_or(Err(KafkaError::Timeout));
-            match result {
-                Ok(()) => HealthCheckOutput::up(),
-                Err(error) => HealthCheckOutput::down().with_details(HashMap::from([(
-                    "error".to_owned(),
-                    serde_json::Value::String(error.to_string()),
-                )])),
+            let stopped: Vec<&str> = self
+                .consumers
+                .iter()
+                .filter(|(_, c)| !c.running.load(Ordering::Relaxed))
+                .map(|(name, _)| name.as_str())
+                .collect();
+            let mut details = HashMap::new();
+            if let Err(error) = &result {
+                details.insert("error".to_owned(), serde_json::json!(error.to_string()));
+            }
+            if !stopped.is_empty() {
+                details.insert("stopped_consumers".to_owned(), serde_json::json!(stopped));
+            }
+            if details.is_empty() {
+                HealthCheckOutput::up()
+            } else {
+                HealthCheckOutput::down().with_details(details)
             }
         })
     }

@@ -264,7 +264,7 @@ impl KafkaRuntime {
         state.insert_extension(producer.clone());
         let health = KafkaHealth::new(
             producer.backend(),
-            vec![],
+            metrics.consumers().to_vec(),
             Duration::from_millis(config.health.timeout_ms),
             config.health.readiness,
         );

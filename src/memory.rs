@@ -1,6 +1,6 @@
 //! An in-memory broker for tests.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -35,6 +35,7 @@ struct State {
     /// The next offset to read, for each (group, topic).
     committed: HashMap<(String, String), i64>,
     unavailable: bool,
+    rejected: HashSet<String>,
 }
 
 impl Inner {
@@ -96,7 +97,9 @@ impl MemoryBroker {
     }
 
     /// Makes the broker reject all sends to `topic` with [`KafkaError::Rejected`].
-    pub fn reject_topic(&self, _topic: impl Into<String>) {}
+    pub fn reject_topic(&self, topic: impl Into<String>) {
+        self.inner.lock().rejected.insert(topic.into());
+    }
 
     fn check_available(&self) -> Result<(), KafkaError> {
         if self.inner.lock().unavailable {
@@ -154,7 +157,15 @@ impl ProducerBackend for MemoryBroker {
         record: Record,
         _timeout: Duration,
     ) -> BoxFuture<'_, Result<Delivery, KafkaError>> {
-        let result = self.check_available().map(|()| self.publish(record));
+        let rejected = self.inner.lock().rejected.contains(record.topic());
+        let result = if rejected {
+            Err(KafkaError::Rejected(format!(
+                "memory broker rejects topic {:?}",
+                record.topic()
+            )))
+        } else {
+            self.check_available().map(|()| self.publish(record))
+        };
         Box::pin(async move { result })
     }
 

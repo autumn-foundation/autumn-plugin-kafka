@@ -48,6 +48,11 @@ impl KafkaMetrics {
         }
     }
 
+    /// Returns the counters of all consumers.
+    pub fn consumers(&self) -> &[(String, Arc<ConsumerCounters>)] {
+        &self.consumers
+    }
+
     /// Returns the counters of a consumer.
     pub fn consumer(&self, name: &str) -> Option<Arc<ConsumerCounters>> {
         self.consumers
@@ -108,6 +113,23 @@ impl MetricsSource for KafkaMetrics {
                 .collect();
             families.push(counter(name, help, samples));
         }
+        families.push(MetricFamily {
+            name: "kafka_consumer_running".to_owned(),
+            help: "1 while the consumer loop runs, else 0".to_owned(),
+            kind: MetricKind::Gauge,
+            samples: self
+                .consumers
+                .iter()
+                .map(|(consumer, c)| MetricSample {
+                    labels: vec![("consumer".to_owned(), consumer.clone())],
+                    value: if c.running.load(Ordering::Relaxed) {
+                        1.0
+                    } else {
+                        0.0
+                    },
+                })
+                .collect(),
+        });
         families
     }
 }

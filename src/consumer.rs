@@ -26,6 +26,8 @@ pub type HandlerError = Box<dyn std::error::Error + Send + Sync>;
 type Handler =
     Arc<dyn Fn(Message, AppState) -> BoxFuture<'static, Result<(), HandlerError>> + Send + Sync>;
 
+/// The prefix of all dead-letter headers.
+const DLQ_HEADER_PREFIX: &str = "autumn.dlq.";
 /// Dead-letter header: the consumer name.
 pub const DLQ_HEADER_CONSUMER: &str = "autumn.dlq.consumer";
 /// Dead-letter header: the source topic.
@@ -167,6 +169,14 @@ impl Consumer {
         })
     }
 
+    /// Returns the sum of all retry delays for one message.
+    fn retry_budget(&self) -> Duration {
+        (1..=self.max_retries)
+            .map(|attempt| self.backoff(attempt))
+            .try_fold(Duration::ZERO, Duration::checked_add)
+            .unwrap_or(Duration::MAX)
+    }
+
     /// Returns the delay before retry number `attempt` (1-based).
     fn backoff(&self, attempt: u32) -> Duration {
         let factor = 2u32.saturating_pow(attempt.saturating_sub(1));
@@ -221,9 +231,37 @@ pub fn validate_consumers(consumers: &[Consumer], config: &KafkaConfig) -> Resul
                  or one of its own topics"
             ));
         }
-        let group = c.spec(config)?.group_id;
+        if c.retry_backoff.is_zero() {
+            return fail(format!(
+                "consumer {name:?}: retry_backoff must be greater than 0"
+            ));
+        }
+        let spec = c.spec(config)?;
+        let group = spec.group_id;
         if group.trim().is_empty() {
             return fail(format!("consumer {name:?} has an empty group"));
+        }
+        let max_poll = spec
+            .properties
+            .get(MAX_POLL_INTERVAL)
+            .or_else(|| config.consumer.properties.get(MAX_POLL_INTERVAL))
+            .or_else(|| config.properties.get(MAX_POLL_INTERVAL))
+            .map_or(Ok(DEFAULT_MAX_POLL_INTERVAL_MS), |v| {
+                v.trim().parse::<u64>()
+            })
+            .map_err(|_| {
+                KafkaError::Config(format!(
+                    "consumer {name:?}: {MAX_POLL_INTERVAL} is not a number"
+                ))
+            })?;
+        let budget = c.retry_budget();
+        if budget >= Duration::from_millis(max_poll) {
+            return fail(format!(
+                "consumer {name:?}: the total retry delay ({} ms) must be less than \
+                 {MAX_POLL_INTERVAL} ({max_poll} ms); the broker removes a consumer that \
+                 does not poll in time",
+                budget.as_millis()
+            ));
         }
         for topic in &c.topics {
             if let Some(other) = subscriptions.insert((group.clone(), topic.as_str()), name) {
@@ -238,17 +276,26 @@ pub fn validate_consumers(consumers: &[Consumer], config: &KafkaConfig) -> Resul
 }
 
 /// Receives and processes messages until `shutdown` is cancelled.
+///
+/// The loop also stops if the client panics, or if the broker rejects a
+/// dead-letter record. Then the consumer is not running, and health is `DOWN`.
 pub async fn run_consumer(
-    mut backend: Box<dyn ConsumerBackend>,
+    backend: Box<dyn ConsumerBackend>,
     consumer: Consumer,
     producer: KafkaProducer,
     state: AppState,
     counters: Arc<ConsumerCounters>,
     shutdown: CancellationToken,
 ) {
+    let mut guard = LoopGuard {
+        backend: Some(backend),
+        counters: Arc::clone(&counters),
+        shutdown: shutdown.clone(),
+        name: consumer.name.clone(),
+    };
     let Some(handler) = consumer.handler.clone() else {
         tracing::error!(consumer = %consumer.name, "Kafka consumer has no handler");
-        backend.close().await;
+        guard.close().await;
         return;
     };
     let worker = Worker {
@@ -259,32 +306,51 @@ pub async fn run_consumer(
         counters: &counters,
         shutdown: &shutdown,
     };
+    counters.running.store(true, Ordering::Relaxed);
     tracing::info!(consumer = %consumer.name, topics = ?consumer.topics, "Kafka consumer started");
-    loop {
-        let received = tokio::select! {
-            biased;
-            () = shutdown.cancelled() => break,
-            received = backend.recv() => received,
-        };
-        match received {
-            Ok(msg) => {
-                if worker.process(&mut *backend, &msg).await == Outcome::Cancelled {
-                    break;
-                }
-            }
-            Err(error) => {
-                counters.receive_errors.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(consumer = %consumer.name, %error, "Kafka receive failed");
-                if sleep_or_cancel(RECEIVE_ERROR_BACKOFF, &shutdown).await {
-                    break;
-                }
-            }
-        }
+    if let Some(backend) = guard.backend.as_deref_mut() {
+        worker.receive_loop(backend).await;
     }
-    backend.close().await;
+    guard.close().await;
     tracing::info!(consumer = %consumer.name, "Kafka consumer stopped");
 }
 
+/// Closes the backend and clears the running flag, also when the task is aborted.
+struct LoopGuard {
+    backend: Option<Box<dyn ConsumerBackend>>,
+    counters: Arc<ConsumerCounters>,
+    shutdown: CancellationToken,
+    name: String,
+}
+
+impl LoopGuard {
+    async fn close(&mut self) {
+        if let Some(backend) = self.backend.take() {
+            backend.close().await;
+        }
+    }
+}
+
+impl Drop for LoopGuard {
+    fn drop(&mut self) {
+        self.counters.running.store(false, Ordering::Relaxed);
+        if !self.shutdown.is_cancelled() {
+            tracing::error!(consumer = %self.name, "Kafka consumer stopped before shutdown");
+        }
+        // An aborted task did not close the backend. Close it off this thread,
+        // because a client close can block.
+        if let Some(backend) = self.backend.take()
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            runtime.spawn(backend.close());
+        }
+    }
+}
+
+/// The `librdkafka` property that limits the time between two polls.
+const MAX_POLL_INTERVAL: &str = "max.poll.interval.ms";
+/// The `librdkafka` default of `max.poll.interval.ms`.
+const DEFAULT_MAX_POLL_INTERVAL_MS: u64 = 300_000;
 /// The longest retry delay.
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// The delay after a receive error.
@@ -298,6 +364,8 @@ enum Outcome {
     Done,
     /// Shutdown started before the commit.
     Cancelled,
+    /// A permanent error. The consumer must stop without a commit.
+    Stopped,
 }
 
 /// The parts that the loop uses to process one message.
@@ -311,6 +379,41 @@ struct Worker<'a> {
 }
 
 impl Worker<'_> {
+    async fn receive_loop(&self, backend: &mut dyn ConsumerBackend) {
+        loop {
+            let received = tokio::select! {
+                biased;
+                () = self.shutdown.cancelled() => return,
+                received = AssertUnwindSafe(backend.recv()).catch_unwind() => received,
+            };
+            match received {
+                Ok(Ok(msg)) => {
+                    if self.process(backend, &msg).await != Outcome::Done {
+                        return;
+                    }
+                }
+                Ok(Err(error)) => {
+                    self.counters.receive_errors.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(consumer = %self.consumer.name, %error, "Kafka receive failed");
+                    if sleep_or_cancel(RECEIVE_ERROR_BACKOFF, self.shutdown).await {
+                        return;
+                    }
+                }
+                Err(panic) => {
+                    // The client can lose the message in a panic. Stop, so that no later
+                    // offset is committed over it.
+                    self.counters.receive_errors.fetch_add(1, Ordering::Relaxed);
+                    tracing::error!(
+                        consumer = %self.consumer.name,
+                        error = %panic_error(panic.as_ref()),
+                        "Kafka client panicked in receive; consumer stopped"
+                    );
+                    return;
+                }
+            }
+        }
+    }
+
     async fn process(&self, backend: &mut dyn ConsumerBackend, msg: &Message) -> Outcome {
         let mut attempt = 0;
         let error = loop {
@@ -343,8 +446,9 @@ impl Worker<'_> {
         };
 
         if let Some(topic) = &self.consumer.dead_letter_topic {
-            if self.dead_letter(topic, msg, &error).await == Outcome::Cancelled {
-                return Outcome::Cancelled;
+            let outcome = self.dead_letter(topic, msg, &error).await;
+            if outcome != Outcome::Done {
+                return outcome;
             }
         } else {
             self.counters.skipped.fetch_add(1, Ordering::Relaxed);
@@ -395,6 +499,18 @@ impl Worker<'_> {
                     );
                     return Outcome::Done;
                 }
+                Err(send_error @ KafkaError::Rejected(_)) => {
+                    tracing::error!(
+                        consumer = %self.consumer.name,
+                        topic = msg.topic(),
+                        partition = msg.partition(),
+                        offset = msg.offset(),
+                        dead_letter_topic = topic,
+                        error = %send_error,
+                        "Kafka rejected the dead-letter record; consumer stopped with no commit"
+                    );
+                    return Outcome::Stopped;
+                }
                 Err(send_error) => {
                     attempt += 1;
                     tracing::error!(
@@ -427,16 +543,18 @@ impl Worker<'_> {
 
 fn dead_letter_record(topic: &str, consumer: &str, msg: &Message, error: &HandlerError) -> Record {
     let mut record = if msg.is_tombstone() {
-        Record::tombstone(topic, msg.key().unwrap_or_default())
+        Record::keyless_tombstone(topic)
     } else {
-        let record = Record::new(topic, msg.payload());
-        match msg.key() {
-            Some(key) => record.with_key(key),
-            None => record,
-        }
+        Record::new(topic, msg.payload())
     };
+    if let Some(key) = msg.key() {
+        record = record.with_key(key);
+    }
+    // Drop incoming plugin headers, so that a producer cannot forge them.
     for (name, value) in msg.headers() {
-        record = record.with_header(name.clone(), value.clone());
+        if !name.starts_with(DLQ_HEADER_PREFIX) {
+            record = record.with_header(name.clone(), value.clone());
+        }
     }
     record
         .with_header(DLQ_HEADER_CONSUMER, consumer)
