@@ -1,6 +1,7 @@
 //! The producer handle for handlers, jobs, and consumers.
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use autumn_web::AppState;
@@ -51,14 +52,26 @@ impl KafkaProducer {
     /// Returns [`KafkaError::Timeout`] after `producer.send_timeout_ms`.
     /// The broker can still get the record after a timeout.
     /// Returns other errors from the client.
-    pub async fn send(&self, _record: Record) -> Result<Delivery, KafkaError> {
-        todo!()
+    pub async fn send(&self, record: Record) -> Result<Delivery, KafkaError> {
+        let result = tokio::time::timeout(
+            self.send_timeout,
+            self.backend.send(record, self.send_timeout),
+        )
+        .await
+        .unwrap_or(Err(KafkaError::Timeout));
+        let counter = if result.is_ok() {
+            &self.metrics.produced
+        } else {
+            &self.metrics.produce_errors
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+        result
     }
 
     /// Returns the producer that the plugin installed, if the plugin started.
     #[must_use]
-    pub fn from_state(_state: &AppState) -> Option<Self> {
-        todo!()
+    pub fn from_state(state: &AppState) -> Option<Self> {
+        state.extension::<Self>().map(|p| (*p).clone())
     }
 }
 
@@ -75,16 +88,15 @@ impl FromRequestParts<AppState> for KafkaProducer {
 
     async fn from_request_parts(
         _parts: &mut Parts,
-        _state: &AppState,
+        state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        todo!()
+        Self::from_state(state)
+            .ok_or_else(|| AutumnError::service_unavailable_msg("Kafka producer is not started"))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::Ordering;
-
     use futures::future::BoxFuture;
 
     use super::*;

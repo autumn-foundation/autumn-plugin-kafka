@@ -1,9 +1,9 @@
 //! Counters for `/actuator/prometheus` and `/actuator/metrics`.
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use autumn_web::actuator::{MetricFamily, MetricsSource};
+use autumn_web::actuator::{MetricFamily, MetricKind, MetricSample, MetricsSource};
 
 /// Counters for one consumer.
 #[derive(Debug, Default)]
@@ -32,32 +32,103 @@ pub(crate) struct KafkaMetrics {
 
 impl KafkaMetrics {
     /// Makes counters for the named consumers.
-    pub fn new<I, S>(_consumer_names: I) -> Self
+    pub fn new<I, S>(consumer_names: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        todo!()
+        Self {
+            consumers: consumer_names
+                .into_iter()
+                .map(|name| (name.into(), Arc::default()))
+                .collect(),
+            ..Self::default()
+        }
     }
 
     /// Returns the counters of a consumer.
-    pub fn consumer(&self, _name: &str) -> Option<Arc<ConsumerCounters>> {
-        todo!()
+    pub fn consumer(&self, name: &str) -> Option<Arc<ConsumerCounters>> {
+        self.consumers
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, c)| Arc::clone(c))
     }
 }
 
 impl MetricsSource for KafkaMetrics {
     fn collect(&self) -> Vec<MetricFamily> {
-        todo!()
+        let mut families = vec![
+            counter(
+                "kafka_messages_produced_total",
+                "Records that the broker accepted",
+                vec![sample(vec![], &self.produced)],
+            ),
+            counter(
+                "kafka_produce_errors_total",
+                "Records that the broker did not accept",
+                vec![sample(vec![], &self.produce_errors)],
+            ),
+        ];
+        let per_consumer: [(&str, &str, fn(&ConsumerCounters) -> &AtomicU64); 5] = [
+            (
+                "kafka_messages_consumed_total",
+                "Messages that the handler processed",
+                |c| &c.consumed,
+            ),
+            (
+                "kafka_handler_errors_total",
+                "Handler attempts that failed",
+                |c| &c.handler_errors,
+            ),
+            (
+                "kafka_messages_dead_lettered_total",
+                "Messages sent to the dead-letter topic",
+                |c| &c.dead_lettered,
+            ),
+            (
+                "kafka_messages_skipped_total",
+                "Messages skipped after all retries",
+                |c| &c.skipped,
+            ),
+            (
+                "kafka_receive_errors_total",
+                "Client errors while the consumer waits for messages",
+                |c| &c.receive_errors,
+            ),
+        ];
+        for (name, help, field) in per_consumer {
+            let samples = self
+                .consumers
+                .iter()
+                .map(|(consumer, c)| {
+                    sample(vec![("consumer".to_owned(), consumer.clone())], field(c))
+                })
+                .collect();
+            families.push(counter(name, help, samples));
+        }
+        families
+    }
+}
+
+fn counter(name: &str, help: &str, samples: Vec<MetricSample>) -> MetricFamily {
+    MetricFamily {
+        name: name.to_owned(),
+        help: help.to_owned(),
+        kind: MetricKind::Counter,
+        samples,
+    }
+}
+
+#[allow(clippy::cast_precision_loss)] // Counters stay far below 2^53.
+fn sample(labels: Vec<(String, String)>, value: &AtomicU64) -> MetricSample {
+    MetricSample {
+        labels,
+        value: value.load(Ordering::Relaxed) as f64,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::Ordering;
-
-    use autumn_web::actuator::MetricKind;
-
     use super::*;
 
     fn family<'a>(families: &'a [MetricFamily], name: &str) -> &'a MetricFamily {
@@ -116,7 +187,10 @@ mod tests {
         ] {
             let f = family(&families, name);
             assert!(matches!(f.kind, MetricKind::Counter), "{name}");
-            assert!((value(f, Some("orders")) - expected).abs() < f64::EPSILON, "{name}");
+            assert!(
+                (value(f, Some("orders")) - expected).abs() < f64::EPSILON,
+                "{name}"
+            );
             assert!(value(f, Some("audit")).abs() < f64::EPSILON, "{name}");
         }
     }
