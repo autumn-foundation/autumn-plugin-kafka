@@ -1,6 +1,7 @@
 //! The default backend. It uses `rdkafka` (`librdkafka`).
 
 use std::collections::BTreeMap;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,6 +11,7 @@ use rdkafka::consumer::{Consumer as _, StreamConsumer};
 use rdkafka::error::KafkaError as RdKafkaError;
 use rdkafka::message::{BorrowedMessage, Header, Headers as _, Message as _, OwnedHeaders};
 use rdkafka::producer::{FutureProducer, FutureRecord, Producer as _};
+use rdkafka::types::RDKafkaErrorCode;
 use rdkafka::util::Timeout;
 
 use crate::backend::{Backend, ConsumerBackend, ConsumerSpec, ProducerBackend};
@@ -42,7 +44,8 @@ pub fn producer_properties(config: &KafkaConfig) -> BTreeMap<String, String> {
 
 /// Returns the `librdkafka` properties for one consumer.
 pub fn consumer_properties(config: &KafkaConfig, spec: &ConsumerSpec) -> BTreeMap<String, String> {
-    let mut props = config.client_properties(ClientRole::Consumer);
+    let mut props = BTreeMap::from([("auto.offset.reset".to_owned(), "earliest".to_owned())]);
+    props.extend(config.client_properties(ClientRole::Consumer));
     props.extend(spec.properties.clone());
     for (key, value) in [
         ("group.id", spec.group_id.as_str()),
@@ -65,21 +68,53 @@ fn client_config(props: &BTreeMap<String, String>) -> ClientConfig {
 /// Maps a client error. A config error does not show the value, because it can be a secret.
 fn map_error(error: &RdKafkaError) -> KafkaError {
     match error {
-        RdKafkaError::ClientConfig(_, description, key, _value) => {
+        RdKafkaError::ClientConfig(_, description, key, value) => {
+            // `librdkafka` can put the value in the description.
+            let description = if value.is_empty() {
+                description.clone()
+            } else {
+                description.replace(value.as_str(), "<redacted>")
+            };
             KafkaError::Config(format!("{description} (property {key:?})"))
+        }
+        other if other.rdkafka_error_code().is_some_and(is_permanent) => {
+            KafkaError::Rejected(other.to_string())
         }
         other => KafkaError::Client(other.to_string()),
     }
 }
 
+/// Returns `true` for broker answers that a retry cannot change.
+const fn is_permanent(code: RDKafkaErrorCode) -> bool {
+    matches!(
+        code,
+        RDKafkaErrorCode::MessageSizeTooLarge
+            | RDKafkaErrorCode::InvalidMessageSize
+            | RDKafkaErrorCode::InvalidMessage
+            | RDKafkaErrorCode::InvalidRecord
+            | RDKafkaErrorCode::TopicAuthorizationFailed
+            | RDKafkaErrorCode::ClusterAuthorizationFailed
+    )
+}
+
 /// Converts headers one by one. `get` can panic on a bad header; the function skips it.
 ///
 /// Returns the headers and the number of skipped headers.
-fn collect_headers<F>(_count: usize, _get: F) -> (Vec<(String, Vec<u8>)>, usize)
+fn collect_headers<F>(count: usize, get: F) -> (Vec<(String, Vec<u8>)>, usize)
 where
     F: Fn(usize) -> Option<(String, Vec<u8>)>,
 {
-    todo!()
+    let mut headers = Vec::with_capacity(count);
+    let mut skipped = 0;
+    for index in 0..count {
+        // `rdkafka` panics on a header key that is not UTF-8.
+        match std::panic::catch_unwind(AssertUnwindSafe(|| get(index))) {
+            Ok(Some(header)) => headers.push(header),
+            Ok(None) => {}
+            Err(_) => skipped += 1,
+        }
+    }
+    (headers, skipped)
 }
 
 fn join_error(error: &tokio::task::JoinError) -> KafkaError {
@@ -189,8 +224,22 @@ fn to_message(m: &BorrowedMessage<'_>) -> Message {
         msg = msg.with_timestamp_ms(ts);
     }
     if let Some(headers) = m.headers() {
-        for header in headers.iter() {
-            msg = msg.with_header(header.key, header.value.unwrap_or_default());
+        let (headers, skipped) = collect_headers(headers.count(), |i| {
+            headers
+                .try_get(i)
+                .map(|h| (h.key.to_owned(), h.value.unwrap_or_default().to_vec()))
+        });
+        if skipped > 0 {
+            tracing::warn!(
+                topic = m.topic(),
+                partition = m.partition(),
+                offset = m.offset(),
+                skipped,
+                "Kafka message has headers with a key that is not UTF-8; headers skipped"
+            );
+        }
+        for (key, value) in headers {
+            msg = msg.with_header(key, value);
         }
     }
     msg
@@ -224,8 +273,6 @@ impl ConsumerBackend for RdConsumer {
 
 #[cfg(test)]
 mod tests {
-    use rdkafka::types::RDKafkaErrorCode;
-
     use super::*;
 
     fn spec() -> ConsumerSpec {
