@@ -16,6 +16,11 @@ pub enum KafkaError {
     /// The operation did not complete in time.
     #[error("Kafka operation timed out")]
     Timeout,
+    /// The broker rejected the request. A retry does not help.
+    ///
+    /// Examples: the record is too large, or the client has no permission.
+    #[error("Kafka rejected the request: {0}")]
+    Rejected(String),
     /// The broker or the plugin is not available.
     #[error("Kafka is not available: {0}")]
     Unavailable(String),

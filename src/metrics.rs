@@ -1,7 +1,7 @@
 //! Counters for `/actuator/prometheus` and `/actuator/metrics`.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use autumn_web::actuator::{MetricFamily, MetricKind, MetricSample, MetricsSource};
 
@@ -18,6 +18,8 @@ pub struct ConsumerCounters {
     pub skipped: AtomicU64,
     /// Errors from the client when it receives.
     pub receive_errors: AtomicU64,
+    /// `true` while the receive loop runs.
+    pub running: AtomicBool,
 }
 
 /// All plugin counters. Registered as the metrics source `kafka`.
@@ -197,6 +199,23 @@ mod tests {
             );
             assert!(value(f, Some("audit")).abs() < f64::EPSILON, "{name}");
         }
+    }
+
+    #[test]
+    fn collect_reports_running_consumers_as_a_gauge() {
+        let metrics = KafkaMetrics::new(["up", "down"]);
+        metrics
+            .consumer("up")
+            .unwrap()
+            .running
+            .store(true, Ordering::Relaxed);
+
+        let families = metrics.collect();
+
+        let running = family(&families, "kafka_consumer_running");
+        assert!(matches!(running.kind, MetricKind::Gauge));
+        assert!((value(running, Some("up")) - 1.0).abs() < f64::EPSILON);
+        assert!(value(running, Some("down")).abs() < f64::EPSILON);
     }
 
     #[test]

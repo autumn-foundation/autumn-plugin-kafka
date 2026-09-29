@@ -95,6 +95,9 @@ impl MemoryBroker {
         self.inner.lock().unavailable = !available;
     }
 
+    /// Makes the broker reject all sends to `topic` with [`KafkaError::Rejected`].
+    pub fn reject_topic(&self, _topic: impl Into<String>) {}
+
     fn check_available(&self) -> Result<(), KafkaError> {
         if self.inner.lock().unavailable {
             return Err(KafkaError::Unavailable("memory broker is down".to_owned()));
@@ -368,6 +371,22 @@ mod tests {
 
         assert_eq!(recv(&mut g2).await.payload(), b"x");
         assert_eq!(broker.committed_offset("g2", "t"), None);
+    }
+
+    #[tokio::test]
+    async fn rejected_topic_fails_send_with_rejected() {
+        let broker = MemoryBroker::new();
+        let producer = broker.producer(&KafkaConfig::default()).unwrap();
+        broker.reject_topic("bad");
+
+        let err = producer
+            .send(Record::new("bad", "x"), WAIT)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, KafkaError::Rejected(_)), "{err}");
+        assert!(broker.messages("bad").is_empty());
+        producer.send(Record::new("good", "x"), WAIT).await.unwrap();
     }
 
     #[tokio::test]

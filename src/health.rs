@@ -9,13 +9,16 @@ use futures::future::BoxFuture;
 
 use crate::backend::ProducerBackend;
 use crate::error::KafkaError;
+use crate::metrics::ConsumerCounters;
 
 /// Extra time for the framework timeout. The probe timeout ends first.
 const MARGIN_MS: u64 = 500;
 
-/// Reports `UP` if a broker replies to a metadata request in time.
+/// Reports `UP` if a broker replies to a metadata request in time,
+/// and all consumers run.
 pub struct KafkaHealth {
     producer: Arc<dyn ProducerBackend>,
+    consumers: Vec<(String, Arc<ConsumerCounters>)>,
     probe_timeout: Duration,
     readiness: bool,
 }
@@ -24,11 +27,13 @@ impl KafkaHealth {
     /// Makes an indicator. If `readiness` is `true`, it also gates `/ready`.
     pub fn new(
         producer: Arc<dyn ProducerBackend>,
+        consumers: Vec<(String, Arc<ConsumerCounters>)>,
         probe_timeout: Duration,
         readiness: bool,
     ) -> Self {
         Self {
             producer,
+            consumers,
             probe_timeout,
             readiness,
         }
@@ -79,7 +84,7 @@ mod tests {
 
     fn health(broker: &MemoryBroker, readiness: bool) -> KafkaHealth {
         let producer = broker.producer(&KafkaConfig::default()).unwrap();
-        KafkaHealth::new(producer, Duration::from_millis(200), readiness)
+        KafkaHealth::new(producer, vec![], Duration::from_millis(200), readiness)
     }
 
     struct Silent;
@@ -116,13 +121,37 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn down_when_probe_times_out() {
-        let indicator = KafkaHealth::new(Arc::new(Silent), Duration::from_millis(200), false);
+        let indicator =
+            KafkaHealth::new(Arc::new(Silent), vec![], Duration::from_millis(200), false);
 
         let output = indicator.check().await;
 
         assert!(matches!(output.status, HealthStatus::Down));
         let error = output.details["error"].as_str().unwrap();
         assert!(error.contains("timed out"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn down_when_a_consumer_stopped() {
+        let broker = MemoryBroker::new();
+        let producer = broker.producer(&KafkaConfig::default()).unwrap();
+        let up = Arc::new(ConsumerCounters::default());
+        up.running.store(true, std::sync::atomic::Ordering::Relaxed);
+        let down = Arc::new(ConsumerCounters::default());
+        let indicator = KafkaHealth::new(
+            producer,
+            vec![("a".into(), up), ("b".into(), down)],
+            Duration::from_millis(200),
+            false,
+        );
+
+        let output = indicator.check().await;
+
+        assert!(matches!(output.status, HealthStatus::Down));
+        assert_eq!(
+            output.details["stopped_consumers"],
+            serde_json::json!(["b"])
+        );
     }
 
     #[test]

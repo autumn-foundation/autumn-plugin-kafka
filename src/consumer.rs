@@ -648,11 +648,17 @@ mod tests {
             ),
             ("handler", vec![Consumer::new("c", ["t"]).group_id("g")]),
             (
-                "group",
+                "no group",
                 vec![Consumer {
                     group_id: None,
                     ..ok()
                 }],
+            ),
+            ("empty group", vec![ok().group_id(" ")]),
+            ("retry_backoff", vec![ok().retry_backoff(Duration::ZERO)]),
+            (
+                "max.poll.interval.ms",
+                vec![ok().property("max.poll.interval.ms", "1000").max_retries(5)],
             ),
             ("dead-letter", vec![ok().dead_letter_topic("t")]),
             ("dead-letter", vec![ok().dead_letter_topic(" ")]),
@@ -672,6 +678,84 @@ mod tests {
             let err = validate_consumers(&consumers, &config).unwrap_err();
             assert!(err.to_string().contains(needle), "{needle}: {err}");
         }
+    }
+
+    #[test]
+    fn validate_uses_config_max_poll_interval() {
+        let mut config = KafkaConfig::default();
+        config
+            .consumer
+            .properties
+            .insert("max.poll.interval.ms".into(), "500".into());
+        let consumer = Consumer::new("c", ["t"])
+            .group_id("g")
+            .max_retries(3)
+            .handler(|_, _| async { Ok::<_, HandlerError>(()) });
+
+        let err = validate_consumers(&[consumer], &config).unwrap_err();
+
+        assert!(err.to_string().contains("max.poll.interval.ms"), "{err}");
+    }
+
+    #[test]
+    fn validate_accepts_one_group_on_many_topics() {
+        let make = |name: &str, topic: &str| {
+            Consumer::new(name, [topic])
+                .group_id("g")
+                .handler(|_, _| async { Ok::<_, HandlerError>(()) })
+        };
+        let consumers = [make("a", "t1"), make("b", "t2")];
+        validate_consumers(&consumers, &KafkaConfig::default()).unwrap();
+    }
+
+    #[test]
+    fn backoff_doubles_and_stops_at_30_seconds() {
+        let c = Consumer::new("c", ["t"]).retry_backoff(Duration::from_millis(100));
+        assert_eq!(c.backoff(1), Duration::from_millis(100));
+        assert_eq!(c.backoff(2), Duration::from_millis(200));
+        assert_eq!(c.backoff(3), Duration::from_millis(400));
+        assert_eq!(c.backoff(20), MAX_BACKOFF);
+        assert_eq!(c.backoff(u32::MAX), MAX_BACKOFF);
+        let huge = Consumer::new("c", ["t"]).retry_backoff(Duration::MAX);
+        assert_eq!(huge.backoff(1), MAX_BACKOFF);
+    }
+
+    #[test]
+    fn dead_letter_record_keeps_tombstones_and_null_keys() {
+        let error: HandlerError = "e".into();
+        let no_key = dead_letter_record("dlq", "c", &Message::tombstone("in"), &error);
+        assert!(no_key.is_tombstone());
+        assert_eq!(no_key.key(), None);
+
+        let msg = Message::tombstone("in").with_key("k");
+        let with_key = dead_letter_record("dlq", "c", &msg, &error);
+        assert!(with_key.is_tombstone());
+        assert_eq!(with_key.key(), Some(&b"k"[..]));
+    }
+
+    #[test]
+    fn dead_letter_record_replaces_incoming_dlq_headers() {
+        let msg = Message::new("in", "p")
+            .with_header(DLQ_HEADER_TOPIC, "forged")
+            .with_header("autumn.dlq.other", "x")
+            .with_header("keep", "v");
+
+        let record = dead_letter_record("dlq", "c", &msg, &"e".into());
+
+        let topics: Vec<_> = record
+            .headers()
+            .iter()
+            .filter(|(n, _)| n == DLQ_HEADER_TOPIC)
+            .collect();
+        assert_eq!(topics.len(), 1);
+        assert_eq!(topics[0].1, b"in");
+        assert!(
+            record
+                .headers()
+                .iter()
+                .all(|(n, _)| n != "autumn.dlq.other")
+        );
+        assert!(record.headers().iter().any(|(n, _)| n == "keep"));
     }
 
     #[test]
@@ -784,6 +868,181 @@ mod tests {
         assert_eq!(load(&h.counters().dead_lettered), 1);
         assert_eq!(load(&h.counters().skipped), 0);
         h.stop().await;
+    }
+
+    #[tokio::test]
+    async fn tombstone_goes_to_the_dead_letter_topic_as_a_tombstone() {
+        let broker = MemoryBroker::new();
+        let calls = Arc::new(AtomicU32::new(0));
+        let consumer = flaky(u32::MAX, &calls)
+            .max_retries(0)
+            .dead_letter_topic("in.dlq");
+        let h = Harness::start(&broker, consumer);
+
+        broker.publish(Record::tombstone("in", "k"));
+
+        wait_until("commit", || h.committed() == Some(1)).await;
+        let dead = broker.messages("in.dlq");
+        assert!(dead[0].is_tombstone());
+        assert_eq!(dead[0].key(), Some(&b"k"[..]));
+        h.stop().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_dead_letter_outage_does_not_commit() {
+        let broker = MemoryBroker::new();
+        let calls = Arc::new(AtomicU32::new(0));
+        let consumer = flaky(u32::MAX, &calls)
+            .max_retries(0)
+            .dead_letter_topic("in.dlq");
+        let h = Harness::start(&broker, consumer);
+        broker.set_available(false);
+
+        broker.publish(Record::new("in", "x"));
+        wait_until("a send error", || load(&h.metrics.produce_errors) >= 1).await;
+        let broker = h.broker.clone();
+        h.stop().await;
+
+        assert_eq!(broker.committed_offset(GROUP, "in"), None);
+        assert!(broker.messages("in.dlq").is_empty());
+    }
+
+    #[tokio::test]
+    async fn rejected_dead_letter_send_stops_the_consumer() {
+        let broker = MemoryBroker::new();
+        broker.reject_topic("in.dlq");
+        let calls = Arc::new(AtomicU32::new(0));
+        let consumer = flaky(u32::MAX, &calls)
+            .max_retries(0)
+            .dead_letter_topic("in.dlq");
+        let h = Harness::start(&broker, consumer);
+
+        broker.publish(Record::new("in", "x"));
+        broker.publish(Record::new("in", "y"));
+
+        let counters = h.counters();
+        tokio::time::timeout(Duration::from_secs(5), h.task)
+            .await
+            .expect("the loop stops by itself")
+            .unwrap();
+        assert_eq!(broker.committed_offset(GROUP, "in"), None);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(!counters.running.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn running_flag_follows_the_loop() {
+        let broker = MemoryBroker::new();
+        let h = Harness::start(&broker, flaky(0, &Arc::new(AtomicU32::new(0))));
+        let counters = h.counters();
+
+        wait_until("running", || counters.running.load(Ordering::Relaxed)).await;
+        h.stop().await;
+
+        assert!(!counters.running.load(Ordering::Relaxed));
+    }
+
+    /// A consumer backend that panics in `recv`.
+    struct PanicRecv;
+
+    impl ConsumerBackend for PanicRecv {
+        fn recv(&mut self) -> BoxFuture<'_, Result<Message, KafkaError>> {
+            Box::pin(async { panic!("bad header") })
+        }
+
+        fn commit(&mut self, _message: &Message) -> Result<(), KafkaError> {
+            Ok(())
+        }
+
+        fn close(self: Box<Self>) -> BoxFuture<'static, ()> {
+            Box::pin(async {})
+        }
+    }
+
+    fn test_producer(broker: &MemoryBroker, metrics: &Arc<KafkaMetrics>) -> KafkaProducer {
+        KafkaProducer::new(
+            broker.producer(&KafkaConfig::default()).unwrap(),
+            Duration::from_secs(1),
+            Arc::clone(metrics),
+        )
+    }
+
+    #[tokio::test]
+    async fn receive_panic_stops_the_consumer() {
+        let broker = MemoryBroker::new();
+        let metrics = Arc::new(KafkaMetrics::new(["c"]));
+        let counters = metrics.consumer("c").unwrap();
+        let task = tokio::spawn(run_consumer(
+            Box::new(PanicRecv),
+            flaky(0, &Arc::new(AtomicU32::new(0))),
+            test_producer(&broker, &metrics),
+            AppState::detached(),
+            Arc::clone(&counters),
+            CancellationToken::new(),
+        ));
+
+        let result = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the loop stops by itself");
+
+        assert!(result.is_ok(), "the panic does not leave the task");
+        assert!(!counters.running.load(Ordering::Relaxed));
+        assert_eq!(load(&counters.receive_errors), 1);
+    }
+
+    /// A consumer backend that counts `close` calls.
+    struct CloseProbe {
+        inner: Box<dyn ConsumerBackend>,
+        closed: Arc<AtomicU32>,
+    }
+
+    impl ConsumerBackend for CloseProbe {
+        fn recv(&mut self) -> BoxFuture<'_, Result<Message, KafkaError>> {
+            self.inner.recv()
+        }
+
+        fn commit(&mut self, message: &Message) -> Result<(), KafkaError> {
+            self.inner.commit(message)
+        }
+
+        fn close(self: Box<Self>) -> BoxFuture<'static, ()> {
+            self.closed.fetch_add(1, Ordering::SeqCst);
+            self.inner.close()
+        }
+    }
+
+    #[tokio::test]
+    async fn aborted_loop_still_closes_the_backend() {
+        let broker = MemoryBroker::new();
+        let metrics = Arc::new(KafkaMetrics::new(["c"]));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let signal = Arc::clone(&started);
+        let consumer = base().handler(move |_, _| {
+            signal.notify_one();
+            futures::future::pending::<Result<(), HandlerError>>()
+        });
+        let closed = Arc::new(AtomicU32::new(0));
+        let config = KafkaConfig::default();
+        let backend = Box::new(CloseProbe {
+            inner: broker
+                .consumer(&config, &consumer.spec(&config).unwrap())
+                .unwrap(),
+            closed: Arc::clone(&closed),
+        });
+        let task = tokio::spawn(run_consumer(
+            backend,
+            consumer,
+            test_producer(&broker, &metrics),
+            AppState::detached(),
+            metrics.consumer("c").unwrap(),
+            CancellationToken::new(),
+        ));
+        broker.publish(Record::new("in", "x"));
+        started.notified().await;
+
+        task.abort();
+
+        wait_until("close", || closed.load(Ordering::SeqCst) == 1).await;
     }
 
     #[tokio::test]
@@ -966,7 +1225,9 @@ mod tests {
             shutdown.clone(),
         ));
 
+        let start = tokio::time::Instant::now();
         wait_until("commit", || committed.load(Ordering::SeqCst) == 1).await;
+        assert!(start.elapsed() >= RECEIVE_ERROR_BACKOFF);
         assert_eq!(load(&metrics.consumer("c").unwrap().receive_errors), 1);
         shutdown.cancel();
         task.await.unwrap();
