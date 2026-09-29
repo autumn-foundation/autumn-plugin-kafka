@@ -25,6 +25,7 @@ use crate::error::KafkaError;
 
 /// The kind of Kafka client that a property map is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ClientRole {
     /// A producer.
     Producer,
@@ -35,6 +36,7 @@ pub enum ClientRole {
 /// Settings for the plugin. Maps to the `[kafka]` section.
 #[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
 pub struct KafkaConfig {
     /// Comma-separated `host:port` list. Default: `localhost:9092`.
     pub brokers: String,
@@ -57,6 +59,7 @@ pub struct KafkaConfig {
 /// Producer settings. Maps to `[kafka.producer]`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
 pub struct ProducerSettings {
     /// `librdkafka` properties for the producer only.
     pub properties: BTreeMap<String, String>,
@@ -67,6 +70,7 @@ pub struct ProducerSettings {
 /// Consumer settings. Maps to `[kafka.consumer]`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
 pub struct ConsumerSettings {
     /// `librdkafka` properties for consumers only.
     pub properties: BTreeMap<String, String>,
@@ -75,6 +79,7 @@ pub struct ConsumerSettings {
 /// Health indicator settings. Maps to `[kafka.health]`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
 pub struct HealthSettings {
     /// If `true`, a broker outage also fails `/ready`. Default: `false`.
     pub readiness: bool,

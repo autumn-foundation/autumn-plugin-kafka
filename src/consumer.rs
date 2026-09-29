@@ -431,19 +431,19 @@ fn dead_letter_record(topic: &str, consumer: &str, msg: &Message, error: &Handle
     } else {
         let record = Record::new(topic, msg.payload());
         match msg.key() {
-            Some(key) => record.key(key),
+            Some(key) => record.with_key(key),
             None => record,
         }
     };
     for (name, value) in msg.headers() {
-        record = record.header(name.clone(), value.clone());
+        record = record.with_header(name.clone(), value.clone());
     }
     record
-        .header(DLQ_HEADER_CONSUMER, consumer)
-        .header(DLQ_HEADER_TOPIC, msg.topic())
-        .header(DLQ_HEADER_PARTITION, msg.partition().to_string())
-        .header(DLQ_HEADER_OFFSET, msg.offset().to_string())
-        .header(
+        .with_header(DLQ_HEADER_CONSUMER, consumer)
+        .with_header(DLQ_HEADER_TOPIC, msg.topic())
+        .with_header(DLQ_HEADER_PARTITION, msg.partition().to_string())
+        .with_header(DLQ_HEADER_OFFSET, msg.offset().to_string())
+        .with_header(
             DLQ_HEADER_ERROR,
             truncate(&error.to_string(), MAX_ERROR_HEADER_LEN),
         )
@@ -763,7 +763,11 @@ mod tests {
             .dead_letter_topic("in.dlq");
         let h = Harness::start(&broker, consumer);
 
-        broker.publish(Record::new("in", "payload").key("k").header("trace", "t1"));
+        broker.publish(
+            Record::new("in", "payload")
+                .with_key("k")
+                .with_header("trace", "t1"),
+        );
 
         wait_until("commit", || h.committed() == Some(1)).await;
         let dead = broker.messages("in.dlq");

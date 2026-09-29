@@ -41,7 +41,7 @@ impl Record {
         value: &T,
     ) -> Result<Self, KafkaError> {
         let payload = serde_json::to_vec(value)?;
-        Ok(Self::new(topic, payload).header("content-type", "application/json"))
+        Ok(Self::new(topic, payload).with_header("content-type", "application/json"))
     }
 
     /// Makes a record with no payload (a tombstone) for a key.
@@ -57,14 +57,14 @@ impl Record {
 
     /// Sets the key.
     #[must_use]
-    pub fn key(mut self, key: impl Into<Vec<u8>>) -> Self {
+    pub fn with_key(mut self, key: impl Into<Vec<u8>>) -> Self {
         self.key = Some(key.into());
         self
     }
 
     /// Adds a header.
     #[must_use]
-    pub fn header(mut self, name: impl Into<String>, value: impl Into<Vec<u8>>) -> Self {
+    pub fn with_header(mut self, name: impl Into<String>, value: impl Into<Vec<u8>>) -> Self {
         self.headers.push((name.into(), value.into()));
         self
     }
@@ -77,14 +77,20 @@ impl Record {
 
     /// Returns the key.
     #[must_use]
-    pub fn key_bytes(&self) -> Option<&[u8]> {
+    pub fn key(&self) -> Option<&[u8]> {
         self.key.as_deref()
     }
 
-    /// Returns the payload. `None` is a tombstone.
+    /// Returns the payload. A tombstone gives an empty slice.
     #[must_use]
-    pub fn payload(&self) -> Option<&[u8]> {
-        self.payload.as_deref()
+    pub fn payload(&self) -> &[u8] {
+        self.payload.as_deref().unwrap_or_default()
+    }
+
+    /// Returns `true` if the record has no payload.
+    #[must_use]
+    pub const fn is_tombstone(&self) -> bool {
+        self.payload.is_none()
     }
 
     /// Returns all headers in order.
@@ -96,11 +102,20 @@ impl Record {
 
 /// The position of a record after the broker accepted it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Delivery {
     /// The partition.
     pub partition: i32,
     /// The offset in the partition.
     pub offset: i64,
+}
+
+impl Delivery {
+    /// Makes a delivery. Custom backends use it.
+    #[must_use]
+    pub const fn new(partition: i32, offset: i64) -> Self {
+        Self { partition, offset }
+    }
 }
 
 /// A message received from Kafka.
@@ -267,18 +282,19 @@ mod tests {
     fn record_new_has_payload_and_no_key() {
         let record = Record::new("orders", b"hi".to_vec());
         assert_eq!(record.topic(), "orders");
-        assert_eq!(record.payload(), Some(&b"hi"[..]));
-        assert_eq!(record.key_bytes(), None);
+        assert_eq!(record.payload(), b"hi");
+        assert!(!record.is_tombstone());
+        assert_eq!(record.key(), None);
         assert!(record.headers().is_empty());
     }
 
     #[test]
     fn record_builder_sets_key_and_headers() {
         let record = Record::new("t", "p")
-            .key("k")
-            .header("a", "1")
-            .header("b", "2");
-        assert_eq!(record.key_bytes(), Some(&b"k"[..]));
+            .with_key("k")
+            .with_header("a", "1")
+            .with_header("b", "2");
+        assert_eq!(record.key(), Some(&b"k"[..]));
         assert_eq!(
             record.headers(),
             &[
@@ -291,7 +307,7 @@ mod tests {
     #[test]
     fn record_json_encodes_and_sets_content_type() {
         let record = Record::json("orders", &Order { id: 7 }).unwrap();
-        assert_eq!(record.payload(), Some(&br#"{"id":7}"#[..]));
+        assert_eq!(record.payload(), br#"{"id":7}"#);
         assert_eq!(
             record.headers(),
             &[("content-type".to_owned(), b"application/json".to_vec())]
@@ -301,8 +317,9 @@ mod tests {
     #[test]
     fn record_tombstone_has_key_and_no_payload() {
         let record = Record::tombstone("t", "k");
-        assert_eq!(record.payload(), None);
-        assert_eq!(record.key_bytes(), Some(&b"k"[..]));
+        assert!(record.is_tombstone());
+        assert_eq!(record.payload(), b"");
+        assert_eq!(record.key(), Some(&b"k"[..]));
     }
 
     #[test]

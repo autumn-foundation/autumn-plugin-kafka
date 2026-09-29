@@ -4,7 +4,6 @@
 
 mod common;
 
-use std::collections::BTreeMap;
 use std::time::Duration;
 
 use autumn_plugin_kafka::{
@@ -14,12 +13,7 @@ use autumn_plugin_kafka::{
 const WAIT: Duration = Duration::from_secs(30);
 
 fn spec(group: &str, topic: &str) -> ConsumerSpec {
-    ConsumerSpec {
-        name: group.to_owned(),
-        group_id: group.to_owned(),
-        topics: vec![topic.to_owned()],
-        properties: BTreeMap::from([("auto.offset.reset".to_owned(), "earliest".to_owned())]),
-    }
+    ConsumerSpec::new(group, group, [topic]).with_property("auto.offset.reset", "earliest")
 }
 
 async fn recv(consumer: &mut Box<dyn ConsumerBackend>) -> Message {
@@ -41,7 +35,9 @@ async fn round_trip_keeps_key_payload_and_headers() {
     producer.ping(WAIT).await.unwrap();
     let delivery = producer
         .send(
-            Record::new(&topic, "payload").key("k").header("h", "v"),
+            Record::new(&topic, "payload")
+                .with_key("k")
+                .with_header("h", "v"),
             WAIT,
         )
         .await

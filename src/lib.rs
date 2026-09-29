@@ -14,7 +14,7 @@
 //! #[post("/orders/{id}")]
 //! async fn create(producer: KafkaProducer, Path(id): Path<u64>) -> AutumnResult<&'static str> {
 //!     producer
-//!         .send(Record::json("orders", &Order { id })?.key(id.to_string()))
+//!         .send(Record::json("orders", &Order { id })?.with_key(id.to_string()))
 //!         .await?;
 //!     Ok("queued")
 //! }
@@ -81,6 +81,8 @@ pub use consumer::{
     DLQ_HEADER_TOPIC, HandlerError,
 };
 pub use error::KafkaError;
+/// The future type of the backend traits.
+pub use futures::future::BoxFuture;
 pub use memory::MemoryBroker;
 pub use message::{Delivery, Header, Message, Record};
 pub use plugin::{KafkaPlugin, KafkaRuntime, PLUGIN_NAME};

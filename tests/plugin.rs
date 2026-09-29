@@ -14,7 +14,7 @@ use autumn_web::test::TestApp;
 #[post("/orders")]
 async fn create_order(producer: KafkaProducer) -> AutumnResult<&'static str> {
     producer
-        .send(Record::new("orders", r#"{"id":1}"#).key("1"))
+        .send(Record::new("orders", r#"{"id":1}"#).with_key("1"))
         .await?;
     Ok("sent")
 }

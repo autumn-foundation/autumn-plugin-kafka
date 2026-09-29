@@ -59,7 +59,7 @@ impl KafkaPlugin {
             config: None,
             backend: Arc::new(RdKafkaBackend),
             consumers: Vec::new(),
-            runtime: KafkaRuntime::default(),
+            runtime: KafkaRuntime::new(),
         }
     }
 
@@ -154,7 +154,7 @@ impl Plugin for KafkaPlugin {
 }
 
 /// A handle to the running plugin. Clones share one runtime.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct KafkaRuntime {
     inner: Arc<RuntimeInner>,
 }
@@ -174,6 +174,12 @@ struct RuntimeState {
 }
 
 impl KafkaRuntime {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: Arc::default(),
+        }
+    }
+
     /// Returns the producer, after startup.
     #[must_use]
     pub fn producer(&self) -> Option<KafkaProducer> {
@@ -347,7 +353,7 @@ mod tests {
 
     #[tokio::test]
     async fn start_installs_producer_and_health() {
-        let runtime = KafkaRuntime::default();
+        let runtime = KafkaRuntime::new();
         let state = AppState::detached();
         let broker = MemoryBroker::new();
         assert!(!runtime.is_running());
@@ -374,7 +380,7 @@ mod tests {
 
     #[tokio::test]
     async fn start_rejects_bad_config_and_installs_nothing() {
-        let runtime = KafkaRuntime::default();
+        let runtime = KafkaRuntime::new();
         let state = AppState::detached();
 
         let err = runtime
@@ -394,7 +400,7 @@ mod tests {
 
     #[tokio::test]
     async fn start_rejects_bad_consumers() {
-        let runtime = KafkaRuntime::default();
+        let runtime = KafkaRuntime::new();
         let consumers = vec![Consumer::new("c", ["t"]).group_id("g")];
         let m = metrics(&consumers);
 
@@ -413,7 +419,7 @@ mod tests {
 
     #[tokio::test]
     async fn start_twice_is_an_error() {
-        let runtime = KafkaRuntime::default();
+        let runtime = KafkaRuntime::new();
         let state = AppState::detached();
         let broker = MemoryBroker::new();
         runtime
@@ -442,7 +448,7 @@ mod tests {
 
     #[tokio::test]
     async fn consumers_run_until_shutdown() {
-        let runtime = KafkaRuntime::default();
+        let runtime = KafkaRuntime::new();
         let broker = MemoryBroker::new();
         let calls = Arc::new(AtomicU32::new(0));
         let consumers = vec![counting(&calls)];
@@ -471,7 +477,7 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_stops_a_stuck_handler_after_the_timeout() {
-        let runtime = KafkaRuntime::default();
+        let runtime = KafkaRuntime::new();
         let broker = MemoryBroker::new();
         let consumers = vec![
             Consumer::new("c", ["in"])

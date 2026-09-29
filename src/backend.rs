@@ -36,6 +36,7 @@ pub trait Backend: Send + Sync + 'static {
 
 /// The data that a backend needs to make one consumer.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ConsumerSpec {
     /// The consumer name.
     pub name: String,
@@ -45,6 +46,30 @@ pub struct ConsumerSpec {
     pub topics: Vec<String>,
     /// Properties for this consumer only. They override the config.
     pub properties: BTreeMap<String, String>,
+}
+
+impl ConsumerSpec {
+    /// Makes a spec with no extra properties.
+    #[must_use]
+    pub fn new<I, S>(name: impl Into<String>, group_id: impl Into<String>, topics: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            name: name.into(),
+            group_id: group_id.into(),
+            topics: topics.into_iter().map(Into::into).collect(),
+            properties: BTreeMap::new(),
+        }
+    }
+
+    /// Adds a property for this consumer only.
+    #[must_use]
+    pub fn with_property(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.properties.insert(key.into(), value.into());
+        self
+    }
 }
 
 /// Sends records.

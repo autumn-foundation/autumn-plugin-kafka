@@ -284,7 +284,7 @@ mod tests {
     #[tokio::test]
     async fn publish_keeps_key_headers_and_tombstones() {
         let broker = MemoryBroker::new();
-        broker.publish(Record::new("t", "p").key("k").header("h", "v"));
+        broker.publish(Record::new("t", "p").with_key("k").with_header("h", "v"));
         broker.publish(Record::tombstone("t", "k"));
 
         let stored = broker.messages("t");

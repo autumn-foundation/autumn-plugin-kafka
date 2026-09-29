@@ -34,7 +34,7 @@ use autumn_web::prelude::*;
 
 #[post("/orders/{id}")]
 async fn create(producer: KafkaProducer, Path(id): Path<u64>) -> AutumnResult<&'static str> {
-    producer.send(Record::new("orders", id.to_string()).key(id.to_string())).await?;
+    producer.send(Record::new("orders", id.to_string()).with_key(id.to_string())).await?;
     Ok("queued")
 }
 

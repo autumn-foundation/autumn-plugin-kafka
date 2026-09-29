@@ -118,11 +118,11 @@ impl ProducerBackend for RdProducer {
             }
             let mut future_record: FutureRecord<'_, [u8], [u8]> =
                 FutureRecord::to(record.topic()).headers(headers);
-            if let Some(key) = record.key_bytes() {
+            if let Some(key) = record.key() {
                 future_record = future_record.key(key);
             }
-            if let Some(payload) = record.payload() {
-                future_record = future_record.payload(payload);
+            if !record.is_tombstone() {
+                future_record = future_record.payload(record.payload());
             }
             self.producer
                 .send(future_record, Timeout::After(timeout))

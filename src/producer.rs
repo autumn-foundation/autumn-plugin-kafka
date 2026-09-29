@@ -21,7 +21,7 @@ use crate::metrics::KafkaMetrics;
 /// ```rust,ignore
 /// #[post("/orders")]
 /// async fn create(producer: KafkaProducer, Json(order): Json<Order>) -> AutumnResult<()> {
-///     producer.send(Record::json("orders", &order)?.key(order.id.to_string())).await?;
+///     producer.send(Record::json("orders", &order)?.with_key(order.id.to_string())).await?;
 ///     Ok(())
 /// }
 /// ```
