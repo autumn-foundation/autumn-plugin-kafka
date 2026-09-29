@@ -28,7 +28,7 @@ use crate::message::{Delivery, Message, Record};
 pub struct RdKafkaBackend;
 
 /// Returns the `librdkafka` properties for the producer.
-pub(crate) fn producer_properties(config: &KafkaConfig) -> BTreeMap<String, String> {
+pub fn producer_properties(config: &KafkaConfig) -> BTreeMap<String, String> {
     let mut props = BTreeMap::from([
         ("enable.idempotence".to_owned(), "true".to_owned()),
         (
@@ -41,10 +41,7 @@ pub(crate) fn producer_properties(config: &KafkaConfig) -> BTreeMap<String, Stri
 }
 
 /// Returns the `librdkafka` properties for one consumer.
-pub(crate) fn consumer_properties(
-    config: &KafkaConfig,
-    spec: &ConsumerSpec,
-) -> BTreeMap<String, String> {
+pub fn consumer_properties(config: &KafkaConfig, spec: &ConsumerSpec) -> BTreeMap<String, String> {
     let mut props = config.client_properties(ClientRole::Consumer);
     props.extend(spec.properties.clone());
     for (key, value) in [
@@ -168,11 +165,13 @@ struct RdConsumer {
 }
 
 fn to_message(m: &BorrowedMessage<'_>) -> Message {
-    let mut msg = match m.payload() {
-        Some(payload) => Message::new(m.topic(), payload),
-        None => Message::tombstone(m.topic()),
-    }
-    .with_position(m.partition(), m.offset());
+    let mut msg = m
+        .payload()
+        .map_or_else(
+            || Message::tombstone(m.topic()),
+            |payload| Message::new(m.topic(), payload),
+        )
+        .with_position(m.partition(), m.offset());
     if let Some(key) = m.key() {
         msg = msg.with_key(key);
     }
