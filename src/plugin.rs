@@ -314,11 +314,14 @@ impl std::fmt::Debug for KafkaRuntime {
 mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    use autumn_web::actuator::HealthStatus;
+    use autumn_web::actuator::{HealthStatus, IndicatorGroup};
+    use futures::future::BoxFuture;
 
     use super::*;
+    use crate::backend::{ConsumerBackend, ConsumerSpec, ProducerBackend};
     use crate::consumer::HandlerError;
     use crate::memory::MemoryBroker;
+    use crate::message::Delivery;
     use crate::message::Record;
 
     fn metrics(consumers: &[Consumer]) -> Arc<KafkaMetrics> {
@@ -469,7 +472,7 @@ mod tests {
         runtime.shutdown().await;
         runtime.shutdown().await; // A second call is safe.
         broker.publish(Record::new("in", "b"));
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::task::yield_now().await;
 
         assert!(!runtime.is_running());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -477,13 +480,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_stops_a_stuck_handler_after_the_timeout() {
+    async fn shutdown_aborts_a_stuck_handler_after_the_timeout() {
+        struct DropFlag(Arc<AtomicU32>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
         let runtime = KafkaRuntime::new();
         let broker = MemoryBroker::new();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let dropped = Arc::new(AtomicU32::new(0));
+        let (signal, flag) = (Arc::clone(&started), Arc::clone(&dropped));
         let consumers = vec![
             Consumer::new("c", ["in"])
                 .group_id("g")
-                .handler(|_, _| futures::future::pending::<Result<(), HandlerError>>()),
+                .handler(move |_, _| {
+                    signal.notify_one();
+                    let guard = DropFlag(Arc::clone(&flag));
+                    async move {
+                        let _guard = guard;
+                        futures::future::pending::<Result<(), HandlerError>>().await
+                    }
+                }),
         ];
         let m = metrics(&consumers);
         let config = KafkaConfig {
@@ -494,12 +513,244 @@ mod tests {
             .start(&AppState::detached(), &config, &broker, consumers, &m)
             .unwrap();
         broker.publish(Record::new("in", "x"));
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        started.notified().await;
 
         tokio::time::timeout(Duration::from_secs(5), runtime.shutdown())
             .await
             .expect("shutdown ends after the timeout");
 
+        assert_eq!(dropped.load(Ordering::SeqCst), 1, "the handler was aborted");
         assert_eq!(broker.committed_offset("g", "in"), None);
+    }
+
+    /// A backend that records producer flush timeouts and can fail consumers.
+    struct Probe {
+        broker: MemoryBroker,
+        flushes: Arc<Mutex<Vec<Duration>>>,
+        fail_consumers: bool,
+    }
+
+    struct ProbeProducer {
+        inner: Arc<dyn ProducerBackend>,
+        flushes: Arc<Mutex<Vec<Duration>>>,
+    }
+
+    impl ProducerBackend for ProbeProducer {
+        fn send(&self, r: Record, t: Duration) -> BoxFuture<'_, Result<Delivery, KafkaError>> {
+            self.inner.send(r, t)
+        }
+        fn ping(&self, t: Duration) -> BoxFuture<'_, Result<(), KafkaError>> {
+            self.inner.ping(t)
+        }
+        fn flush(&self, t: Duration) -> BoxFuture<'_, Result<(), KafkaError>> {
+            self.flushes.lock().unwrap().push(t);
+            self.inner.flush(t)
+        }
+    }
+
+    impl Backend for Probe {
+        fn producer(&self, c: &KafkaConfig) -> Result<Arc<dyn ProducerBackend>, KafkaError> {
+            Ok(Arc::new(ProbeProducer {
+                inner: self.broker.producer(c)?,
+                flushes: Arc::clone(&self.flushes),
+            }))
+        }
+        fn consumer(
+            &self,
+            c: &KafkaConfig,
+            spec: &ConsumerSpec,
+        ) -> Result<Box<dyn ConsumerBackend>, KafkaError> {
+            if self.fail_consumers {
+                return Err(KafkaError::Client("no consumer".into()));
+            }
+            self.broker.consumer(c, spec)
+        }
+    }
+
+    fn probe(broker: &MemoryBroker) -> (Probe, Arc<Mutex<Vec<Duration>>>) {
+        let flushes = Arc::new(Mutex::new(Vec::new()));
+        let probe = Probe {
+            broker: broker.clone(),
+            flushes: Arc::clone(&flushes),
+            fail_consumers: false,
+        };
+        (probe, flushes)
+    }
+
+    /// A consumer that signals when its handler starts, then works for `work`.
+    fn slow(started: &Arc<tokio::sync::Notify>, work: Duration) -> Consumer {
+        let started = Arc::clone(started);
+        Consumer::new("c", ["in"])
+            .group_id("g")
+            .handler(move |_, _| {
+                started.notify_one();
+                async move {
+                    tokio::time::sleep(work).await;
+                    Ok::<_, HandlerError>(())
+                }
+            })
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_the_current_handler() {
+        let runtime = KafkaRuntime::new();
+        let broker = MemoryBroker::new();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let consumers = vec![slow(&started, Duration::from_millis(200))];
+        let m = metrics(&consumers);
+        runtime
+            .start(
+                &AppState::detached(),
+                &KafkaConfig::default(),
+                &broker,
+                consumers,
+                &m,
+            )
+            .unwrap();
+        broker.publish(Record::new("in", "x"));
+        started.notified().await;
+
+        runtime.shutdown().await;
+
+        assert_eq!(broker.committed_offset("g", "in"), Some(1));
+    }
+
+    #[tokio::test]
+    async fn shutdown_flushes_the_producer_in_time() {
+        let runtime = KafkaRuntime::new();
+        let broker = MemoryBroker::new();
+        let (backend, flushes) = probe(&broker);
+        runtime
+            .start(
+                &AppState::detached(),
+                &KafkaConfig::default(),
+                &backend,
+                vec![],
+                &metrics(&[]),
+            )
+            .unwrap();
+
+        runtime.shutdown().await;
+
+        let flushes = flushes.lock().unwrap().clone();
+        assert_eq!(flushes.len(), 1);
+        assert!(flushes[0] <= Duration::from_secs(10), "{flushes:?}");
+    }
+
+    #[tokio::test]
+    async fn shutdown_gives_the_flush_a_minimum_time() {
+        let runtime = KafkaRuntime::new();
+        let broker = MemoryBroker::new();
+        let (backend, flushes) = probe(&broker);
+        let config = KafkaConfig {
+            shutdown_timeout_ms: 0,
+            ..KafkaConfig::default()
+        };
+        runtime
+            .start(
+                &AppState::detached(),
+                &config,
+                &backend,
+                vec![],
+                &metrics(&[]),
+            )
+            .unwrap();
+
+        runtime.shutdown().await;
+
+        assert!(flushes.lock().unwrap()[0] >= Duration::from_millis(500));
+    }
+
+    #[tokio::test]
+    async fn shutdown_resumes_after_an_outer_timeout_drops_it() {
+        let runtime = KafkaRuntime::new();
+        let broker = MemoryBroker::new();
+        let (backend, flushes) = probe(&broker);
+        let started = Arc::new(tokio::sync::Notify::new());
+        let consumers = vec![slow(&started, Duration::from_millis(300))];
+        let m = metrics(&consumers);
+        runtime
+            .start(
+                &AppState::detached(),
+                &KafkaConfig::default(),
+                &backend,
+                consumers,
+                &m,
+            )
+            .unwrap();
+        broker.publish(Record::new("in", "x"));
+        started.notified().await;
+
+        let first = tokio::time::timeout(Duration::from_millis(50), runtime.shutdown()).await;
+        assert!(first.is_err(), "the outer timeout drops the first call");
+        runtime.shutdown().await;
+
+        assert_eq!(broker.committed_offset("g", "in"), Some(1));
+        assert_eq!(flushes.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn readiness_flag_sets_the_health_group() {
+        let runtime = KafkaRuntime::new();
+        let state = AppState::detached();
+        let mut config = KafkaConfig::default();
+        config.health.readiness = true;
+        runtime
+            .start(&state, &config, &MemoryBroker::new(), vec![], &metrics(&[]))
+            .unwrap();
+
+        let results = state.health_indicator_registry().run_all().await;
+
+        assert!(matches!(results[0].group, IndicatorGroup::Readiness));
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn failing_consumer_client_installs_nothing() {
+        let runtime = KafkaRuntime::new();
+        let state = AppState::detached();
+        let (mut backend, _) = probe(&MemoryBroker::new());
+        backend.fail_consumers = true;
+        let consumers = vec![counting(&Arc::new(AtomicU32::new(0)))];
+        let m = metrics(&consumers);
+
+        let err = runtime
+            .start(&state, &KafkaConfig::default(), &backend, consumers, &m)
+            .unwrap_err();
+
+        assert!(err.to_string().contains("no consumer"), "{err}");
+        assert!(KafkaProducer::from_state(&state).is_none());
+        assert!(!state.health_indicator_registry().contains("kafka"));
+        assert!(!runtime.is_running());
+    }
+
+    #[tokio::test]
+    async fn is_running_is_false_when_a_consumer_stopped() {
+        let runtime = KafkaRuntime::new();
+        let broker = MemoryBroker::new();
+        broker.reject_topic("in.dlq");
+        let consumers = vec![
+            Consumer::new("c", ["in"])
+                .group_id("g")
+                .max_retries(0)
+                .dead_letter_topic("in.dlq")
+                .handler(|_, _| async { Err::<(), _>("always") }),
+        ];
+        let m = metrics(&consumers);
+        runtime
+            .start(
+                &AppState::detached(),
+                &KafkaConfig::default(),
+                &broker,
+                consumers,
+                &m,
+            )
+            .unwrap();
+        assert!(runtime.is_running());
+
+        broker.publish(Record::new("in", "x"));
+
+        wait_until("the consumer stops", || !runtime.is_running()).await;
+        runtime.shutdown().await;
     }
 }
