@@ -52,12 +52,13 @@ impl MemoryBroker {
     }
 
     /// Adds a record to its topic. Returns its position.
+    #[allow(clippy::must_use_candidate)] // Tests often ignore the position.
     #[allow(clippy::missing_panics_doc)] // The offset cannot exceed `i64::MAX`.
     pub fn publish(&self, record: Record) -> Delivery {
         let mut state = self.inner.lock();
         let log = state.topics.entry(record.topic().to_owned()).or_default();
         let offset = i64::try_from(log.len()).expect("offset fits in i64");
-        log.push(to_message(record, offset));
+        log.push(Message::from_record(record, 0, offset, Some(now_ms())));
         drop(state);
         self.inner.notify.notify_waiters();
         Delivery {
@@ -102,23 +103,10 @@ impl MemoryBroker {
     }
 }
 
-fn to_message(record: Record, offset: i64) -> Message {
-    let now_ms = SystemTime::now()
+fn now_ms() -> i64 {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
-    let mut msg = match record.payload() {
-        Some(payload) => Message::new(record.topic(), payload),
-        None => Message::tombstone(record.topic()),
-    }
-    .with_position(0, offset)
-    .with_timestamp_ms(now_ms);
-    if let Some(key) = record.key_bytes() {
-        msg = msg.with_key(key);
-    }
-    for (name, value) in record.headers() {
-        msg = msg.with_header(name.clone(), value.clone());
-    }
-    msg
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
 impl std::fmt::Debug for MemoryBroker {

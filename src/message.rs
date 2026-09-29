@@ -226,6 +226,24 @@ impl Message {
         self.timestamp_ms
     }
 
+    /// Makes a message from a record at a position. Moves all record fields.
+    pub(crate) fn from_record(
+        record: Record,
+        partition: i32,
+        offset: i64,
+        timestamp_ms: Option<i64>,
+    ) -> Self {
+        Self {
+            topic: record.topic,
+            partition,
+            offset,
+            key: record.key,
+            payload: record.payload,
+            headers: record.headers,
+            timestamp_ms,
+        }
+    }
+
     /// Decodes the payload as JSON.
     ///
     /// # Errors
