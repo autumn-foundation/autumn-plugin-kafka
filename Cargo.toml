@@ -22,7 +22,7 @@ dynamic-linking = ["rdkafka/dynamic-linking"]
 [dependencies]
 autumn-web = { version = "0.7.0", default-features = false }
 futures = "0.3"
-rdkafka = { version = "0.39", features = ["tokio"] }
+rdkafka = { version = "0.39", features = ["tokio", "tracing"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
