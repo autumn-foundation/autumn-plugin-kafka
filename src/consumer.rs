@@ -193,10 +193,7 @@ impl std::fmt::Debug for Consumer {
 /// # Errors
 ///
 /// Returns [`KafkaError::Config`] with the first problem found.
-pub(crate) fn validate_consumers(
-    consumers: &[Consumer],
-    config: &KafkaConfig,
-) -> Result<(), KafkaError> {
+pub fn validate_consumers(consumers: &[Consumer], config: &KafkaConfig) -> Result<(), KafkaError> {
     let fail = |msg: String| Err(KafkaError::Config(msg));
     let mut names = HashSet::new();
     let mut subscriptions: HashMap<(String, &str), &str> = HashMap::new();
@@ -216,13 +213,13 @@ pub(crate) fn validate_consumers(
         if c.handler.is_none() {
             return fail(format!("consumer {name:?} has no handler"));
         }
-        if let Some(dlq) = &c.dead_letter_topic {
-            if dlq.trim().is_empty() || c.topics.contains(dlq) {
-                return fail(format!(
-                    "consumer {name:?} has a bad dead-letter topic: it must not be empty \
-                     or one of its own topics"
-                ));
-            }
+        if let Some(dlq) = &c.dead_letter_topic
+            && (dlq.trim().is_empty() || c.topics.contains(dlq))
+        {
+            return fail(format!(
+                "consumer {name:?} has a bad dead-letter topic: it must not be empty \
+                 or one of its own topics"
+            ));
         }
         let group = c.spec(config)?.group_id;
         if group.trim().is_empty() {
@@ -241,7 +238,7 @@ pub(crate) fn validate_consumers(
 }
 
 /// Receives and processes messages until `shutdown` is cancelled.
-pub(crate) async fn run_consumer(
+pub async fn run_consumer(
     mut backend: Box<dyn ConsumerBackend>,
     consumer: Consumer,
     producer: KafkaProducer,
@@ -371,11 +368,11 @@ impl Worker<'_> {
         }));
         let fut = match call {
             Ok(fut) => fut,
-            Err(panic) => return Err(panic_error(&panic)),
+            Err(panic) => return Err(panic_error(panic.as_ref())),
         };
         match AssertUnwindSafe(fut).catch_unwind().await {
             Ok(result) => result,
-            Err(panic) => Err(panic_error(&panic)),
+            Err(panic) => Err(panic_error(panic.as_ref())),
         }
     }
 
