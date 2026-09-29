@@ -1,5 +1,6 @@
 //! The `kafka` health indicator.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -7,6 +8,7 @@ use autumn_web::actuator::{HealthCheckOutput, HealthIndicator, IndicatorGroup};
 use futures::future::BoxFuture;
 
 use crate::backend::ProducerBackend;
+use crate::error::KafkaError;
 
 /// Extra time for the framework timeout. The probe timeout ends first.
 const MARGIN_MS: u64 = 500;
@@ -35,15 +37,33 @@ impl KafkaHealth {
 
 impl HealthIndicator for KafkaHealth {
     fn check(&self) -> BoxFuture<'_, HealthCheckOutput> {
-        todo!()
+        Box::pin(async move {
+            let probe = self.producer.ping(self.probe_timeout);
+            let result = tokio::time::timeout(self.probe_timeout, probe)
+                .await
+                .unwrap_or(Err(KafkaError::Timeout));
+            match result {
+                Ok(()) => HealthCheckOutput::up(),
+                Err(error) => HealthCheckOutput::down().with_details(HashMap::from([(
+                    "error".to_owned(),
+                    serde_json::Value::String(error.to_string()),
+                )])),
+            }
+        })
     }
 
     fn timeout_ms(&self) -> u64 {
-        todo!()
+        u64::try_from(self.probe_timeout.as_millis())
+            .unwrap_or(u64::MAX)
+            .saturating_add(MARGIN_MS)
     }
 
     fn group(&self) -> IndicatorGroup {
-        todo!()
+        if self.readiness {
+            IndicatorGroup::Readiness
+        } else {
+            IndicatorGroup::HealthOnly
+        }
     }
 }
 
@@ -54,7 +74,6 @@ mod tests {
     use super::*;
     use crate::backend::Backend;
     use crate::config::KafkaConfig;
-    use crate::error::KafkaError;
     use crate::memory::MemoryBroker;
     use crate::message::{Delivery, Record};
 
