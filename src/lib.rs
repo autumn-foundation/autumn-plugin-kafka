@@ -1,0 +1,1 @@
+//! Kafka plugin for Autumn.
