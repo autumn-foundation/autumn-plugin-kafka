@@ -1,0 +1,45 @@
+[package]
+name = "autumn-plugin-kafka"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88.0"
+description = "Kafka producer and consumer plugin for autumn-web applications"
+license = "Apache-2.0"
+repository = "https://github.com/autumn-foundation/autumn-plugin-kafka"
+readme = "README.md"
+keywords = ["autumn", "kafka", "plugin", "messaging", "web"]
+categories = ["web-programming", "asynchronous"]
+include = ["src/**", "examples/**", "README.md", "LICENSE", "Cargo.toml"]
+
+[features]
+default = []
+# Pass-through features of `rdkafka`.
+ssl = ["rdkafka/ssl"]
+ssl-vendored = ["rdkafka/ssl-vendored"]
+gssapi = ["rdkafka/gssapi"]
+zstd = ["rdkafka/zstd"]
+dynamic-linking = ["rdkafka/dynamic-linking"]
+cmake-build = ["rdkafka/cmake-build"]
+
+[dependencies]
+autumn-web = { version = "0.7.0", default-features = false }
+futures = "0.3"
+rdkafka = { version = "0.39", features = ["tokio", "tracing"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+toml = "1"
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+tempfile = "3"
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
