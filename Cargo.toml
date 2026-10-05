@@ -22,7 +22,7 @@ dynamic-linking = ["rdkafka/dynamic-linking"]
 cmake-build = ["rdkafka/cmake-build"]
 
 [dependencies]
-autumn-web = { version = "0.7.0", default-features = false }
+autumn-web = { version = "0.8.0", default-features = false }
 futures = "0.3"
 rdkafka = { version = "0.39", features = ["tokio", "tracing"] }
 serde = { version = "1", features = ["derive"] }
