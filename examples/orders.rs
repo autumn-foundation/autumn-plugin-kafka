@@ -225,12 +225,14 @@ async fn main() {
         return;
     }
     // The plugin reads `[kafka]` from `autumn.toml` and `AUTUMN_KAFKA__*`.
-    autumn_web::app()
-        .plugin(plugin())
-        .state_initializer(|state| state.insert_extension(Ledger::default()))
-        .routes(routes![place_order, cancel_order, ledger])
-        .run()
-        .await;
+    Box::pin(
+        autumn_web::app()
+            .plugin(plugin())
+            .state_initializer(|state| state.insert_extension(Ledger::default()))
+            .routes(routes![place_order, cancel_order, ledger])
+            .run(),
+    )
+    .await;
 }
 
 // ── Self-check: drives the same app and checks every part ───────────────────
