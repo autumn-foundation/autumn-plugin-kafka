@@ -89,7 +89,13 @@ async fn consumer_gets_messages() {
 #[tokio::test(flavor = "multi_thread")]
 async fn health_endpoint_reports_kafka() {
     let broker = MemoryBroker::new();
-    let client = TestApp::new().plugin(memory_plugin(&broker)).build();
+    // Autumn 0.9 caches health results for 1 s. The test reads twice.
+    let mut config = autumn_web::config::AutumnConfig::default();
+    config.health.cache_ttl_ms = 0;
+    let client = TestApp::new()
+        .config(config)
+        .plugin(memory_plugin(&broker))
+        .build();
 
     let up = client.get("/actuator/health").send().await;
     up.assert_status(200);
