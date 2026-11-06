@@ -92,3 +92,8 @@ pub use message::{Delivery, Header, Message, Record};
 pub use plugin::{KafkaPlugin, KafkaRuntime, PLUGIN_NAME};
 pub use producer::KafkaProducer;
 pub use rdkafka_backend::RdKafkaBackend;
+
+/// Compiles the Rust snippets of the README as doctests.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+pub struct ReadmeDoctests;
