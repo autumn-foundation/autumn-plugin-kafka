@@ -32,7 +32,7 @@ For TLS or SASL, enable the `ssl` feature.
 
 ## Use
 
-```rust
+```rust,no_run
 use autumn_plugin_kafka::{Consumer, HandlerError, KafkaPlugin, KafkaProducer, Message, Record};
 use autumn_web::prelude::*;
 
@@ -144,14 +144,27 @@ Use `MemoryBroker` in your app tests. It does not need Docker.
 `TestApp` does not run shutdown hooks. Call `runtime.shutdown()` at the end of a test.
 
 ```rust
-let broker = MemoryBroker::new();
-let client = TestApp::new()
-    .plugin(KafkaPlugin::new().config(KafkaConfig::default()).backend(broker.clone()))
-    .routes(routes![create])
-    .build();
+use autumn_plugin_kafka::{KafkaConfig, KafkaPlugin, KafkaProducer, MemoryBroker, Record};
+use autumn_web::prelude::*;
+use autumn_web::test::TestApp;
 
-client.post("/orders/7").send().await.assert_status(200);
-assert_eq!(broker.messages("orders").len(), 1);
+#[post("/orders/{id}")]
+async fn create(producer: KafkaProducer, Path(id): Path<u64>) -> AutumnResult<&'static str> {
+    producer.send(Record::new("orders", id.to_string()).with_key(id.to_string())).await?;
+    Ok("queued")
+}
+
+#[tokio::test]
+async fn an_order_goes_to_the_topic() {
+    let broker = MemoryBroker::new();
+    let client = TestApp::new()
+        .plugin(KafkaPlugin::new().config(KafkaConfig::default()).backend(broker.clone()))
+        .routes(routes![create])
+        .build();
+
+    client.post("/orders/7").send().await.assert_status(200);
+    assert_eq!(broker.messages("orders").len(), 1);
+}
 ```
 
 To test a handler alone, call it with `Message::new(..)` and `AppState::detached()`.
