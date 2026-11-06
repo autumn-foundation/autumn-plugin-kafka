@@ -323,7 +323,7 @@ async fn place(client: &TestClient, id: u64, cents: i64) {
 }
 
 async fn wait_for(client: &TestClient, done: impl Fn(&LedgerView) -> bool) -> LedgerView {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let deadline = tokio::time::Instant::now() + Duration::from_mins(1);
     loop {
         let view: LedgerView = client.get("/ledger").send().await.json();
         if done(&view) {

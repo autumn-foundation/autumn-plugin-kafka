@@ -15,7 +15,7 @@ CI runs its self-check against `MemoryBroker` and a real broker.
 
 ```toml
 [dependencies]
-autumn-plugin-kafka = "0.2"
+autumn-plugin-kafka = "0.3"
 ```
 
 The crate compiles `librdkafka`. You must have a C compiler, `make`, and `zlib`.
