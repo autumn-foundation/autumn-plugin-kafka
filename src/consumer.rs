@@ -1308,7 +1308,7 @@ mod tests {
         let calls = Arc::new(AtomicU32::new(0));
         let consumer = flaky(u32::MAX, &calls)
             .max_retries(5)
-            .retry_backoff(Duration::from_secs(3600));
+            .retry_backoff(Duration::from_hours(1));
         let h = Harness::start(&broker, consumer);
 
         broker.publish(Record::new("in", "x"));

@@ -9,7 +9,7 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
   # Pinned, so that a new lint in a new Rust release does not fail CI.
-  RUST_TOOLCHAIN: "1.94.1"
+  RUST_TOOLCHAIN: "1.97.0"
 
 jobs:
   lint:
@@ -32,7 +32,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --all-targets
 
