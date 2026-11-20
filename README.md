@@ -15,7 +15,7 @@ CI runs its self-check against `MemoryBroker` and a real broker.
 
 ```toml
 [dependencies]
-autumn-plugin-kafka = "0.3"
+autumn-plugin-kafka = "0.4"
 ```
 
 The crate compiles `librdkafka`. You must have a C compiler, `make`, and `zlib`.
@@ -120,6 +120,20 @@ timeout_ms = 1500                # default
 - A new group starts at the first message (`auto.offset.reset = earliest`), if you do not set it.
 - The producer uses `enable.idempotence = true`, if you do not set it.
 - `KafkaProducer::send` times out 500 ms after `producer.send_timeout_ms`. The broker can still get the record after a timeout.
+
+## Roles
+
+The consumers run in the `kafka.consumers` background task. Its capability is `kafka.consumer`, with the parent `job_workers`. So the `combined` and `worker` roles consume, and the `web` role does not. The producer works on each role. `/actuator/tasks` and `autumn graph` show the task.
+
+A named role can turn the consumers off:
+
+```toml
+[roles.cron]
+base = "worker"
+capabilities = { "kafka.consumer" = false }
+```
+
+A role that does not consume makes no consumer client. Its health does not count consumers.
 
 ## Health and metrics
 

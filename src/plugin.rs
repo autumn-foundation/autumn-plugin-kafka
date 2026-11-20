@@ -5,14 +5,15 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use autumn_web::AppState;
 use autumn_web::actuator::HealthIndicator as _;
 use autumn_web::app::AppBuilder;
+use autumn_web::background::PluginCapability;
 use autumn_web::plugin::Plugin;
 use autumn_web::reexports::tokio_util::sync::CancellationToken;
+use autumn_web::{AppState, Capability};
 use tokio::task::JoinHandle;
 
-use crate::backend::Backend;
+use crate::backend::{Backend, ConsumerBackend};
 use crate::config::KafkaConfig;
 use crate::consumer::{Consumer, run_consumer, validate_consumers};
 use crate::error::KafkaError;
@@ -23,6 +24,16 @@ use crate::rdkafka_backend::RdKafkaBackend;
 
 /// The plugin name.
 pub const PLUGIN_NAME: &str = "autumn-plugin-kafka";
+
+/// The capability of the consumers. A role runs it when it runs job workers
+/// (`combined`, `worker`). A named role can turn it off:
+/// `[roles.<name>] capabilities = { "kafka.consumer" = false }`.
+pub const KAFKA_CONSUMER: PluginCapability =
+    PluginCapability::new("kafka.consumer", Capability::JobWorkers);
+
+/// The name of the background task that runs the consumers.
+/// `/actuator/tasks` and `autumn graph` show it.
+pub const CONSUMER_TASK: &str = "kafka.consumers";
 
 /// The Kafka plugin.
 ///
@@ -159,6 +170,16 @@ impl Plugin for KafkaPlugin {
                     Ok(())
                 }
             })
+            .background_task(CONSUMER_TASK, KAFKA_CONSUMER, {
+                let runtime = runtime.clone();
+                move |_state, shutdown| {
+                    let runtime = runtime.clone();
+                    async move {
+                        runtime.run_consumers(shutdown).await;
+                        Ok(())
+                    }
+                }
+            })
             .on_shutdown(move || {
                 let runtime = runtime.clone();
                 async move { runtime.shutdown().await }
@@ -184,9 +205,19 @@ struct RuntimeInner {
 #[derive(Default)]
 struct RuntimeState {
     started: bool,
+    /// Consumers that wait for the background task.
+    pending: Vec<PendingConsumer>,
     producer: Option<KafkaProducer>,
     consumers: Vec<Arc<ConsumerCounters>>,
     shutdown_timeout: Duration,
+}
+
+/// A consumer and its client, before the background task starts it.
+struct PendingConsumer {
+    consumer: Consumer,
+    client: Box<dyn ConsumerBackend>,
+    counters: Arc<ConsumerCounters>,
+    state: AppState,
 }
 
 /// The minimum time for the last producer flush.
@@ -250,6 +281,51 @@ impl KafkaRuntime {
         }
     }
 
+    /// Runs the consumers of this process until `shutdown` or
+    /// [`Self::shutdown`].
+    ///
+    /// The `kafka.consumers` background task calls this. The framework starts
+    /// it only on a role that runs [`KAFKA_CONSUMER`]. At `shutdown`, the
+    /// consumers stop. The shutdown hook waits for them, then flushes the
+    /// producer.
+    pub async fn run_consumers(&self, shutdown: CancellationToken) {
+        if !self.spawn_pending().await {
+            return;
+        }
+        tokio::select! {
+            () = shutdown.cancelled() => self.inner.shutdown.cancel(),
+            () = self.inner.shutdown.cancelled() => {}
+        }
+    }
+
+    /// Starts the consumers that wait for the background task. Returns
+    /// `false` when the runtime did not start or shuts down.
+    pub(crate) async fn spawn_pending(&self) -> bool {
+        let mut tasks = self.inner.tasks.lock().await;
+        if self.inner.shutdown.is_cancelled() {
+            return false;
+        }
+        let (pending, producer) = {
+            let mut state = self.lock();
+            (std::mem::take(&mut state.pending), state.producer.clone())
+        };
+        let Some(producer) = producer else {
+            return false;
+        };
+        for p in pending {
+            tasks.push(tokio::spawn(run_consumer(
+                p.client,
+                p.consumer,
+                producer.clone(),
+                p.state,
+                p.counters,
+                self.inner.shutdown.clone(),
+            )));
+        }
+        drop(tasks);
+        true
+    }
+
     fn lock(&self) -> MutexGuard<'_, RuntimeState> {
         // The state has no invariant that a panic can break.
         self.inner
@@ -283,15 +359,24 @@ impl KafkaRuntime {
             Arc::clone(metrics),
         );
         let mut bound = Vec::with_capacity(consumers.len());
-        for consumer in consumers {
-            let client = backend.consumer(config, &consumer.spec(config)?)?;
-            bound.push((consumer, client));
+        if state.role().runs_plugin(KAFKA_CONSUMER) {
+            for consumer in consumers {
+                let client = backend.consumer(config, &consumer.spec(config)?)?;
+                bound.push((consumer, client));
+            }
         }
 
         state.insert_extension(producer.clone());
+        // A role that does not run the consumers makes no consumer client,
+        // and its health does not count them.
+        let consume = state.role().runs_plugin(KAFKA_CONSUMER);
         let health = KafkaHealth::new(
             producer.backend(),
-            metrics.consumers().to_vec(),
+            if consume {
+                metrics.consumers().to_vec()
+            } else {
+                Vec::new()
+            },
             Duration::from_millis(config.health.timeout_ms),
             config.health.readiness,
         );
@@ -304,35 +389,30 @@ impl KafkaRuntime {
             tracing::warn!(%error, "Kafka health indicator not registered");
         }
 
-        let mut tasks = self
-            .inner
-            .tasks
-            .try_lock()
-            .map_err(|_| KafkaError::Config("the plugin is shutting down".to_owned()))?;
+        let consumers = bound.len();
         for (consumer, client) in bound {
             let counters = metrics.consumer(consumer.name()).unwrap_or_default();
+            // Mark it as running now: the background task starts it right
+            // after the startup hooks, so health is not down in that gap.
             counters.running.store(true, Ordering::Relaxed);
             runtime.consumers.push(Arc::clone(&counters));
-            tasks.push(tokio::spawn(run_consumer(
-                client,
+            runtime.pending.push(PendingConsumer {
                 consumer,
-                producer.clone(),
-                state.clone(),
+                client,
                 counters,
-                self.inner.shutdown.clone(),
-            )));
+                state: state.clone(),
+            });
         }
         tracing::info!(
             brokers = %config.brokers,
             client_id = %config.client_id,
-            consumers = tasks.len(),
+            consumers,
             "Kafka plugin started"
         );
         runtime.producer = Some(producer);
         runtime.shutdown_timeout = Duration::from_millis(config.shutdown_timeout_ms);
         runtime.started = true;
         drop(runtime);
-        drop(tasks);
         Ok(())
     }
 }
@@ -406,6 +486,8 @@ mod tests {
             )
             .unwrap();
 
+        runtime.spawn_pending().await;
+
         assert!(runtime.is_running());
         let producer = KafkaProducer::from_state(&state).expect("a producer extension");
         producer.send(Record::new("t", "x")).await.unwrap();
@@ -469,6 +551,7 @@ mod tests {
                 &metrics(&[]),
             )
             .unwrap();
+        runtime.spawn_pending().await;
 
         let err = runtime
             .start(
@@ -500,6 +583,7 @@ mod tests {
                 &m,
             )
             .unwrap();
+        runtime.spawn_pending().await;
 
         broker.publish(Record::new("in", "a"));
         wait_until("one call", || calls.load(Ordering::SeqCst) == 1).await;
@@ -546,6 +630,7 @@ mod tests {
         runtime
             .start(&AppState::detached(), &config, &broker, consumers, &m)
             .unwrap();
+        runtime.spawn_pending().await;
         broker.publish(Record::new("in", "x"));
         started.notified().await;
 
@@ -641,6 +726,7 @@ mod tests {
                 &m,
             )
             .unwrap();
+        runtime.spawn_pending().await;
         broker.publish(Record::new("in", "x"));
         started.notified().await;
 
@@ -663,6 +749,7 @@ mod tests {
                 &metrics(&[]),
             )
             .unwrap();
+        runtime.spawn_pending().await;
 
         runtime.shutdown().await;
 
@@ -689,6 +776,7 @@ mod tests {
                 &metrics(&[]),
             )
             .unwrap();
+        runtime.spawn_pending().await;
 
         runtime.shutdown().await;
 
@@ -712,6 +800,7 @@ mod tests {
                 &m,
             )
             .unwrap();
+        runtime.spawn_pending().await;
         broker.publish(Record::new("in", "x"));
         started.notified().await;
 
@@ -732,6 +821,7 @@ mod tests {
         runtime
             .start(&state, &config, &MemoryBroker::new(), vec![], &metrics(&[]))
             .unwrap();
+        runtime.spawn_pending().await;
 
         let results = state.health_indicator_registry().run_all().await;
 
@@ -780,6 +870,7 @@ mod tests {
                 &m,
             )
             .unwrap();
+        runtime.spawn_pending().await;
         assert!(runtime.is_running());
 
         broker.publish(Record::new("in", "x"));

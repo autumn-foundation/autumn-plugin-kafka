@@ -89,7 +89,7 @@ pub use error::KafkaError;
 pub use futures::future::BoxFuture;
 pub use memory::MemoryBroker;
 pub use message::{Delivery, Header, Message, Record};
-pub use plugin::{KafkaPlugin, KafkaRuntime, PLUGIN_NAME};
+pub use plugin::{CONSUMER_TASK, KAFKA_CONSUMER, KafkaPlugin, KafkaRuntime, PLUGIN_NAME};
 pub use producer::KafkaProducer;
 pub use rdkafka_backend::RdKafkaBackend;
 
