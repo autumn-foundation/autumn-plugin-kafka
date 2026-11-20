@@ -145,3 +145,67 @@ async fn end_to_end_with_a_real_broker() {
     assert_eq!(seen.lock().unwrap()[0], "real");
     runtime.shutdown().await;
 }
+
+fn role_config(role: &str, extra: &str) -> autumn_web::config::AutumnConfig {
+    toml::from_str(&format!(
+        "role = \"{role}\"\n{extra}\n[actuator]\nsensitive = true\n"
+    ))
+    .expect("config parses")
+}
+
+/// Starts the app as `role` and reads the consumer task from `/actuator/tasks`.
+async fn consumer_task(
+    broker: &MemoryBroker,
+    seen: &Seen,
+    role: &str,
+    extra: &str,
+) -> (autumn_web::test::TestClient, serde_json::Value) {
+    let plugin = memory_plugin(broker).consumer(recorder("events", "g", seen));
+    let client = TestApp::new()
+        .config(role_config(role, extra))
+        .plugin(plugin)
+        .build();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let body: serde_json::Value = client
+        .get("/actuator/tasks")
+        .send()
+        .await
+        .assert_ok()
+        .json();
+    let task = body["background_tasks"][autumn_plugin_kafka::CONSUMER_TASK].clone();
+    (client, task)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_worker_role_runs_the_consumer_task() {
+    let broker = MemoryBroker::new();
+    let seen: Seen = Arc::default();
+    let (_client, task) = consumer_task(&broker, &seen, "worker", "").await;
+    assert_eq!(task["status"], "running", "{task}");
+    assert_eq!(task["capability"], "kafka.consumer", "{task}");
+    assert_eq!(task["parent"], "job_workers", "{task}");
+    broker.publish(Record::new("events", "hello"));
+    wait_until("one message", || seen.lock().unwrap().len() == 1).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_web_role_does_not_consume() {
+    let broker = MemoryBroker::new();
+    let seen: Seen = Arc::default();
+    let (client, task) = consumer_task(&broker, &seen, "web", "").await;
+    assert_eq!(task["status"], "not_placed", "{task}");
+    // The producer still works on a web role.
+    assert!(client.state().extension::<KafkaProducer>().is_some());
+    broker.publish(Record::new("events", "hello"));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(seen.lock().unwrap().is_empty(), "no consumer ran");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_named_role_can_turn_the_consumers_off() {
+    let broker = MemoryBroker::new();
+    let seen: Seen = Arc::default();
+    let roles = "[roles.cron]\nbase = \"worker\"\ncapabilities = { \"kafka.consumer\" = false }\n";
+    let (_client, task) = consumer_task(&broker, &seen, "cron", roles).await;
+    assert_eq!(task["status"], "not_placed", "{task}");
+}
